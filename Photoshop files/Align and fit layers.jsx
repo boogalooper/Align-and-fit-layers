@@ -1,0 +1,1857 @@
+#target photoshop
+/*
+// BEGIN__HARVEST_EXCEPTION_ZSTRING
+<javascriptresource>
+<name>Align and fit layers</name>
+<category>alignment</category>
+<enableinfo>true</enableinfo>
+<eventid>5a2946a7-c3d1-430b-8527-c854f5bb7241</eventid>
+<terminology><![CDATA[<< /Version 1
+    /Events <<
+        /5a2946a7-c3d1-430b-8527-c854f5bb7241 [(Align and fit layers) <<
+            /inAction [(action settings) /boolean]
+        >>]
+    >>
+>> ]]></terminology>
+</javascriptresource>
+// END__HARVEST_EXCEPTION_ZSTRING
+*/
+
+var SCRIPT_VERSION = 0.516,
+    UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
+    API_HOST = '127.0.0.1',
+    API_PORT_SEND = 6320,
+    API_PORT_LISTEN = 6321,
+    API_FILES = ['lib/align-fit-api.pyw', 'align-fit-api.pyw'],
+    RUNTIME_NAME = 'AlignFitRuntime',
+    EXPECTED_SERVER_VERSION = '0.4.1',
+    PREVIEW_MAX = 1280,
+    FINAL_BLEED_PX = 2,
+    INIT_DELAY = 15000,
+    ANALYZE_DELAY = 120000,
+    MATCH_DELAY = 10000,
+    PING_DELAY = 500,
+    lr = new AM('layer'),
+    doc = new AM('document'),
+    previousLayer = new AM('layer', 'backwardEnum'),
+    apl = new AM('application'),
+    str = new Locale(),
+    cfg = new Config(),
+    capabilities = getCapabilities(),
+    runtimeInfo = getRuntimeInfo(),
+    apiFile = findApiFile((new File($.fileName)).path),
+    afApi = null,
+    runCtx = null,
+    inAction = true,
+    isCancelled = false;
+
+$.localize = true;
+
+// Python is an optional engine. Its availability is established only from files
+// already installed on disk; opening the settings dialog never starts a server.
+capabilities.python = pythonFilesAvailable(apiFile, runtimeInfo);
+
+try {
+    var playbackCount = 0;
+    try { playbackCount = app.playbackParameters.count; } catch (e0) { playbackCount = 0; }
+
+    if (!playbackCount || playbackCount == 1) {
+        cfg.getScriptSettings(false);
+        cfg.resolveEngine();
+        var w = dialog(false), result = w.show();
+        if (result == 2) {
+            isCancelled = true;
+        } else {
+            cfg.putScriptSettings(true);
+            runWithPhotoshopProgress();
+        }
+        cfg.putScriptSettings(false);
+    } else {
+        cfg.getScriptSettings(true);
+        cfg.resolveEngine();
+        if (app.playbackDisplayDialogs == DialogModes.ALL) {
+            var wa = dialog(true), resultA = wa.show();
+            if (resultA == 2) {
+                isCancelled = true;
+            } else {
+                cfg.putScriptSettings(true);
+            }
+        }
+        if (app.playbackDisplayDialogs != DialogModes.ALL) {
+            runWithPhotoshopProgress();
+        }
+    }
+} catch (startupError) {
+    if (startupError.number && startupError.number == 8007) {
+        isCancelled = true;
+    } else {
+        alert(startupError, L(str.err));
+    }
+}
+
+isCancelled ? 'cancel' : undefined;
+
+function L(v) {
+    if (typeof v == 'string') return v;
+    try {
+        var loc = String($.locale || '').toLowerCase();
+        if (loc.indexOf('ru') == 0 && v.ru != undefined) return v.ru;
+        if (v.en != undefined) return v.en;
+        if (v.ru != undefined) return v.ru;
+    } catch (e) { }
+    return String(v);
+}
+
+function runWithPhotoshopProgress() {
+    if (!apl.getProperty('numberOfDocuments')) throw new Error(L(str.errDoc));
+    // Use Photoshop's native progress UI. The work functions below increment it
+    // through app.doProgressTask(), matching the pattern used by Face alignment.
+    app.doProgress(L(str.progressTitle), 'runScript();');
+}
+
+function runScript() {
+    var runError = null;
+    try {
+        cleanupStaleTempFiles();
+        runCtx = createRunContext();
+
+        if (cfg.engine == 'python') {
+            app.changeProgressText(L(str.startPython));
+            afApi = new analysisApi(API_HOST, API_PORT_SEND, API_PORT_LISTEN, apiFile, runtimeInfo);
+            afApi.init();
+
+            // Preview generation is one history step and one Undo, so the source
+            // layers/clipping stack return exactly to the pre-analysis state.
+            app.doProgressSegmentTask(28, 0, 100, 'preparePythonStage();');
+            app.doProgressSegmentTask(4, 28, 100, 'analyzePythonStage();');
+            runCtx.subjectSegmentStart = 32;
+            runCtx.frameSegmentStart = 44;
+            runCtx.matchSegmentStart = 64;
+            runCtx.alignSegmentStart = 70;
+        } else if (cfg.engine == 'device' || cfg.engine == 'cloud') {
+            configurePhotoshopSelectionMode();
+
+            // Measure Select Subject inside the layer's own temporary Smart Object.
+            // No JPEG export and no resize are used for Photoshop autoCutout modes.
+            app.doProgressSegmentTask(35, 0, 100, 'prepareAutoCutoutStage();');
+            runCtx.subjectSegmentStart = 35;
+            runCtx.frameSegmentStart = 45;
+            runCtx.matchSegmentStart = 65;
+            runCtx.alignSegmentStart = 70;
+        } else {
+            // Layer-bounds mode deliberately skips all object/face detection.
+            runCtx.subjectSegmentStart = 0;
+            runCtx.frameSegmentStart = 20;
+            runCtx.matchSegmentStart = 55;
+            runCtx.alignSegmentStart = 65;
+        }
+
+        runCtx.sourceDoc.suspendHistory('Align and fit layers', 'mainHistory();');
+        app.changeProgressText(L(str.done));
+        app.updateProgress(100, 100);
+    } catch (e) {
+        runError = e;
+        // Never leave a partly aligned document after an error or ESC.
+        // Restoring history here is safe because no further transforms are run.
+        try {
+            if (runCtx && runCtx.sourceDoc && runCtx.startHistoryState) {
+                app.activeDocument = runCtx.sourceDoc;
+                runCtx.sourceDoc.activeHistoryState = runCtx.startHistoryState;
+            }
+        } catch (historyRestoreError) { }
+    } finally {
+        try {
+            if (runCtx && runCtx.selectionModeChanged && runCtx.originalSelectionMode) {
+                doc.setSelectionMode(runCtx.originalSelectionMode);
+            }
+        } catch (restoreModeError) { }
+        try { if (runCtx && runCtx.tempFiles) cleanupTempFiles(runCtx.tempFiles); } catch (cleanupError) { }
+        try { if (runCtx && runCtx.sourceDoc) app.activeDocument = runCtx.sourceDoc; } catch (docError) { }
+        try { if (runCtx && runCtx.targetIds) reselectLayers(runCtx.targetIds); } catch (selectError) { }
+    }
+    if (runError) throw runError;
+}
+
+function createRunContext() {
+    var sourceDoc = activeDocument,
+        targetList = doc.getProperty('targetLayersIDs'),
+        targetIds = [],
+        layerMeta = {},
+        tempFiles = [];
+
+    for (var ti = 0; ti < targetList.count; ti++) {
+        targetIds.push(targetList.getReference(ti).getIdentifier('layerID'));
+    }
+    if (!targetIds.length) throw new Error(L(str.errLayers));
+
+    var clippedAtStart = 0;
+    for (var mi = 0; mi < targetIds.length; mi++) {
+        var mid = targetIds[mi],
+            isClipped = !!lr.getProperty('group', false, mid);
+        layerMeta[String(mid)] = {
+            name: lr.getProperty('name', false, mid),
+            color: lr.getProperty('color', false, mid)[1],
+            clipped: isClipped,
+            clippingBaseId: null
+        };
+        if (isClipped) clippedAtStart++;
+    }
+
+    var allClippedAtStart = targetIds.length > 0 && clippedAtStart == targetIds.length,
+        subjectTargetIds = targetIds.slice(0),
+        selectedFallback = false,
+        fallbackFrameId = null,
+        allowUnmatched = false,
+        allowedMissingByColor = {},
+        plannedFrameColors = {},
+        plannedFrames = [];
+
+    if (allClippedAtStart) {
+        // Existing clipping structure is authoritative only when every selected
+        // layer was clipped at script start.
+        for (var ci = 0; ci < targetIds.length; ci++) {
+            var cid = targetIds[ci], baseId = findClippingBaseId(cid);
+            if (!baseId) throw new Error('Cannot find clipping base for layer: ' + layerMeta[String(cid)].name);
+            layerMeta[String(cid)].clippingBaseId = baseId;
+        }
+        reselectLayers(targetIds);
+    } else {
+        // Decide normal-vs-fallback BEFORE object detection. This prevents the
+        // common-reference layer from being unnecessarily analyzed as a subject.
+        var selectedSet = {}, subjectCounts = {}, from = doc.getProperty('hasBackgroundLayer') ? 0 : 1,
+            len = doc.getProperty('numberOfLayers');
+        for (var si = 0; si < targetIds.length; si++) {
+            selectedSet[String(targetIds[si])] = true;
+            var sc = String(layerMeta[String(targetIds[si])].color);
+            subjectCounts[sc] = (subjectCounts[sc] || 0) + 1;
+        }
+        for (var li = from; li <= len; li++) {
+            if (lr.getProperty('layerSection', false, li, true)[1] == 'layerSectionEnd') continue;
+            var lid = lr.getProperty('layerID', false, li, true);
+            if (selectedSet[String(lid)]) continue;
+            var lc = lr.getProperty('color', false, li, true)[1];
+            if (lc == 'none') continue;
+            if (!plannedFrameColors[lc]) plannedFrameColors[lc] = [];
+            plannedFrameColors[lc].push(lid);
+        }
+
+        var matchable = 0, shortage = [], missingTotal = 0;
+        for (var color in subjectCounts) {
+            var scount = subjectCounts[color],
+                fcount = plannedFrameColors[color] ? plannedFrameColors[color].length : 0,
+                missing = Math.max(0, scount - fcount);
+            matchable += Math.min(scount, fcount);
+            if (missing > 0) {
+                shortage.push(color + ': ' + fcount + '/' + scount);
+                allowedMissingByColor[String(color)] = missing;
+                missingTotal += missing;
+            }
+        }
+
+        if (targetIds.length > 1 && matchable * 2 < targetIds.length) {
+            selectedFallback = true;
+            fallbackFrameId = getBottomMostSelectedLayerId(targetIds);
+            if (!fallbackFrameId) throw new Error(L(str.errFallbackFrame));
+            // Fallback uses the bottom selected layer as a new common frame.
+            // If that layer is already clipped, its role is ambiguous and the
+            // document structure must not be changed implicitly.
+            if (layerMeta[String(fallbackFrameId)] && layerMeta[String(fallbackFrameId)].clipped) {
+                throw new Error(L(str.errFallbackClipped));
+            }
+            subjectTargetIds = [];
+            for (var fi = 0; fi < targetIds.length; fi++) {
+                if (String(targetIds[fi]) != String(fallbackFrameId)) subjectTargetIds.push(targetIds[fi]);
+            }
+            if (!subjectTargetIds.length) throw new Error(L(str.errLayers));
+            plannedFrames = [fallbackFrameId];
+        } else {
+            // A small shortage is likely a labeling omission. Let the user decide
+            // whether to continue; unmatched layers will remain untouched.
+            if (shortage.length) {
+                if (!showFrameShortageWarning(shortage, missingTotal, targetIds.length)) throw makeUserCancelError();
+                allowUnmatched = true;
+            }
+            for (var pc in subjectCounts) {
+                var pf = plannedFrameColors[pc] || [];
+                for (var pi = 0; pi < pf.length; pi++) plannedFrames.push(pf[pi]);
+            }
+        }
+    }
+
+    return {
+        sourceDoc: sourceDoc,
+        startHistoryState: sourceDoc.activeHistoryState,
+        targetIds: targetIds,
+        subjectTargetIds: subjectTargetIds,
+        layerMeta: layerMeta,
+        tempFiles: tempFiles,
+        items: [],
+        analysisMap: {},
+        subjects: [],
+        frames: [],
+        plannedFrames: plannedFrames,
+        assignments: null,
+        selectedFallback: selectedFallback,
+        allowUnmatched: allowUnmatched,
+        allowedMissingByColor: allowedMissingByColor,
+        allClippedAtStart: allClippedAtStart,
+        previewTouched: false,
+        previewRestored: false,
+        originalSelectionMode: null,
+        selectionModeChanged: false
+    };
+}
+
+function preparePythonStage() {
+    var ctx = runCtx;
+    try {
+        ctx.sourceDoc.suspendHistory('Prepare Align and Fit previews', 'preparePythonPreviewsLoop();');
+        if (!ctx.items.length || ctx.items.length != ctx.subjectTargetIds.length) {
+            throw new Error('Python preview export incomplete: ' + ctx.items.length + ' of ' + ctx.subjectTargetIds.length + ' layers.');
+        }
+        app.changeProgressText(L(str.restoreLayers));
+        undoPreviewHistory(ctx.sourceDoc);
+        ctx.previewRestored = true;
+        reselectLayers(ctx.targetIds);
+    } catch (e) {
+        try {
+            if (ctx.previewTouched && !ctx.previewRestored) {
+                app.activeDocument = ctx.sourceDoc;
+                undoPreviewHistory(ctx.sourceDoc);
+                ctx.previewRestored = true;
+                reselectLayers(ctx.targetIds);
+            }
+        } catch (restoreError) {
+            throw new Error(e.message + '\nAdditionally failed to restore preview history: ' + restoreError.message);
+        }
+        throw e;
+    }
+}
+
+function preparePythonPreviewsLoop() {
+    var n = runCtx.subjectTargetIds.length,
+        slice = 1 / Math.max(1, n);
+    for (var i = 0; i < n; i++) {
+        app.doProgressTask(slice, 'preparePythonPreviewChunk(' + i + ');');
+    }
+}
+
+function preparePythonPreviewChunk(i) {
+    var id = runCtx.subjectTargetIds[i],
+        meta = runCtx.layerMeta[String(id)],
+        name = meta ? meta.name : lr.getProperty('name', false, id),
+        text = L(str.prepareImages) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' \u2014 ' + name;
+    app.activeDocument = runCtx.sourceDoc;
+    lr.selectLayer(id);
+    if (!lr.getProperty('visible')) lr.setLayerVisiblity(id, true);
+    runCtx.previewTouched = true;
+    var preview = exportLayerPreview(runCtx.sourceDoc, id, i, runCtx.tempFiles);
+    if (preview) runCtx.items.push(preview);
+    app.changeProgressText(text);
+    $.sleep(0);
+}
+
+function analyzePythonStage() {
+    app.changeProgressText(L(str.analyzePython));
+    // Large selections can legitimately take longer than the fixed base timeout.
+    // Keep a generous per-image allowance while capping the wait at 15 minutes.
+    var analyzeDelay = Math.max(ANALYZE_DELAY, Math.min(15 * 60 * 1000, runCtx.items.length * 10000)),
+        analyzed = afApi.sendPayload('analyze', { items: runCtx.items }, analyzeDelay);
+    if (!analyzed || !analyzed.items) throw new Error('Python returned an invalid analysis response.');
+    runCtx.analysisMap = {};
+    for (var ai = 0; ai < analyzed.items.length; ai++) {
+        runCtx.analysisMap[String(analyzed.items[ai].id)] = analyzed.items[ai];
+    }
+    cleanupTempFiles(runCtx.tempFiles);
+    runCtx.tempFiles = [];
+}
+
+function prepareAutoCutoutStage() {
+    var ctx = runCtx;
+    try {
+        ctx.sourceDoc.suspendHistory('Measure Align and Fit objects', 'prepareAutoCutoutLoop();');
+        if (countOwnProperties(ctx.analysisMap) != ctx.subjectTargetIds.length) {
+            throw new Error('Photoshop object measurement incomplete.');
+        }
+        app.changeProgressText(L(str.restoreLayers));
+        undoPreviewHistory(ctx.sourceDoc);
+        ctx.previewRestored = true;
+        reselectLayers(ctx.targetIds);
+    } catch (e) {
+        try {
+            if (ctx.previewTouched && !ctx.previewRestored) {
+                app.activeDocument = ctx.sourceDoc;
+                undoPreviewHistory(ctx.sourceDoc);
+                ctx.previewRestored = true;
+                reselectLayers(ctx.targetIds);
+            }
+        } catch (restoreError) {
+            throw new Error(e.message + '\nAdditionally failed to restore measurement history: ' + restoreError.message);
+        }
+        throw e;
+    }
+}
+
+function prepareAutoCutoutLoop() {
+    var n = runCtx.subjectTargetIds.length,
+        slice = 1 / Math.max(1, n);
+    for (var i = 0; i < n; i++) {
+        app.doProgressTask(slice, 'prepareAutoCutoutChunk(' + i + ');');
+    }
+}
+
+function prepareAutoCutoutChunk(i) {
+    var id = runCtx.subjectTargetIds[i],
+        meta = runCtx.layerMeta[String(id)],
+        name = meta ? meta.name : lr.getProperty('name', false, id),
+        text = L(str.detectBounds) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' \u2014 ' + name;
+    app.activeDocument = runCtx.sourceDoc;
+    lr.selectLayer(id);
+    if (!lr.getProperty('visible')) lr.setLayerVisiblity(id, true);
+    runCtx.previewTouched = true;
+    var measured = measureAutoCutoutInSmartObject(runCtx.sourceDoc, id);
+    if (!measured || !measured.bbox) throw new Error(L(str.errNoSubject) + ': ' + name);
+    runCtx.analysisMap[String(id)] = measured;
+    app.changeProgressText(text);
+    $.sleep(0);
+}
+
+function measureAutoCutoutInSmartObject(sourceDoc, id) {
+    var smartDoc = null,
+        oldDialogs = app.displayDialogs,
+        stage = 'select source layer';
+    try {
+        app.displayDialogs = DialogModes.NO;
+        app.activeDocument = sourceDoc;
+        lr.selectLayer(id);
+
+        stage = 'convert source layer to Smart Object';
+        convertActiveLayerToSmartObject();
+
+        stage = 'open Smart Object contents';
+        openActiveSmartObjectContents();
+        smartDoc = app.activeDocument;
+        if (!smartDoc || smartDoc == sourceDoc) throw new Error('Smart Object contents did not open.');
+
+        // Match the Python preparation path: analyze the visible composite of the
+        // selected layer in its own local coordinate system.
+        stage = 'flatten Smart Object contents';
+        if (smartDoc.layers.length > 1) smartDoc.flatten();
+
+        var localW = Number(smartDoc.width.as('px')),
+            localH = Number(smartDoc.height.as('px'));
+        if (!(localW > 0) || !(localH > 0)) throw new Error('Smart Object has invalid dimensions.');
+
+        stage = 'Select Subject';
+        lr.autoCutout();
+        if (!doc.hasProperty('selection')) throw new Error(L(str.errNoSubject));
+        var b = doc.descToObject(doc.getProperty('selection'));
+        lr.deselect();
+        if (!b || !(Number(b.right) > Number(b.left)) || !(Number(b.bottom) > Number(b.top))) {
+            throw new Error(L(str.errNoSubject));
+        }
+
+        var out = {
+            id: id,
+            width: localW,
+            height: localH,
+            bbox: [Number(b.left), Number(b.top), Number(b.right), Number(b.bottom)],
+            faces: 0,
+            bbox_source: cfg.engine == 'cloud' ? 'autoCutout-cloud' : 'autoCutout-device'
+        };
+
+        stage = 'close Smart Object contents';
+        smartDoc.close(SaveOptions.DONOTSAVECHANGES);
+        smartDoc = null;
+        app.activeDocument = sourceDoc;
+        return out;
+    } catch (e) {
+        try {
+            if (smartDoc) {
+                app.activeDocument = smartDoc;
+                smartDoc.close(SaveOptions.DONOTSAVECHANGES);
+                smartDoc = null;
+            }
+        } catch (ignore0) { }
+        try { app.activeDocument = sourceDoc; } catch (ignore1) { }
+        throw new Error('autoCutout failed for layer ' + id + ' [' + stage + ']: ' + e.message);
+    } finally {
+        try { app.activeDocument = sourceDoc; } catch (ignore2) { }
+        app.displayDialogs = oldDialogs;
+    }
+}
+
+function countOwnProperties(o) {
+    var n = 0;
+    for (var k in o) if (o.hasOwnProperty(k)) n++;
+    return n;
+}
+
+function configurePhotoshopSelectionMode() {
+    if (!capabilities.selectionProcessingModes) return;
+    try {
+        runCtx.originalSelectionMode = doc.getSelectionMode();
+        var wanted = cfg.engine == 'cloud' ? 'imageProcessingModeCloud' : 'imageProcessingModeDevice';
+        if (runCtx.originalSelectionMode != wanted) {
+            doc.setSelectionMode(wanted);
+            runCtx.selectionModeChanged = true;
+        }
+    } catch (e) {
+        // Device mode remains valid on versions that support Select Subject but
+        // do not expose the Device/Cloud preference through Action Manager.
+        if (cfg.engine == 'cloud') throw new Error(L(str.errCloudMode));
+    }
+}
+
+function mainHistory() {
+    var s0 = runCtx.subjectSegmentStart,
+        f0 = runCtx.frameSegmentStart,
+        m0 = runCtx.matchSegmentStart,
+        a0 = runCtx.alignSegmentStart;
+
+    app.doProgressSegmentTask(f0 - s0, s0, 100, 'collectSubjectsStage();');
+    prepareFrameList();
+    app.doProgressSegmentTask(m0 - f0, f0, 100, 'readFramesStage();');
+    app.doProgressSegmentTask(a0 - m0, m0, 100, 'matchFramesStage();');
+    app.doProgressSegmentTask(100 - a0, a0, 100, 'alignSubjectsStage();');
+}
+
+function collectSubjectsStage() {
+    var n = runCtx.subjectTargetIds.length,
+        slice = 1 / Math.max(1, n);
+    for (var i = 0; i < n; i++) {
+        app.doProgressTask(slice, 'collectSubjectChunk(' + i + ');');
+    }
+    runCtx.subjects.sort(function (a, b) { return a.ratio > b.ratio ? 1 : -1; });
+}
+
+function collectSubjectChunk(i) {
+    var id = runCtx.subjectTargetIds[i],
+        meta = runCtx.layerMeta[String(id)],
+        layerName = meta ? meta.name : lr.getProperty('name', false, id),
+        text = L(str.detectBounds) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' \u2014 ' + layerName;
+
+    doc.selectLayer(id);
+    if (!lr.getProperty('visible')) lr.setLayerVisiblity(id, true);
+
+    var subject = null;
+    if (cfg.engine == 'python') {
+        var analysis = runCtx.analysisMap[String(id)];
+        if (!analysis) throw new Error('Python returned no result for layer: ' + layerName);
+        if (analysis.error) throw new Error('Python analysis failed for layer "' + layerName + '": ' + analysis.error);
+        if (!analysis.bbox || !analysis.width || !analysis.height) throw new Error('Python did not find an object bounding box for layer: ' + layerName);
+        subject = subjectFromLocalAnalysis(id, analysis, true);
+        if (!subject) throw new Error('Invalid Python bounding box for layer: ' + layerName);
+    } else if (cfg.engine == 'device' || cfg.engine == 'cloud') {
+        var measured = runCtx.analysisMap[String(id)];
+        subject = subjectFromLocalAnalysis(id, measured, false);
+        if (!subject) throw new Error(L(str.errNoSubject) + ': ' + layerName);
+    } else {
+        subject = subjectFromLayerBounds(id);
+        if (!subject) throw new Error(L(str.errLayerBounds) + ': ' + layerName);
+    }
+
+    subject.color = meta ? meta.color : lr.getProperty('color')[1];
+    subject.id = id;
+    runCtx.subjects.push(subject);
+    app.changeProgressText(text);
+    $.sleep(0);
+}
+
+function subjectFromLocalAnalysis(id, analysis, fromPython) {
+    try {
+        if (!analysis || !analysis.bbox || !analysis.width || !analysis.height) return null;
+
+        // Python previews and Photoshop Select Subject are both measured in the
+        // temporary Smart Object's local coordinate system. Re-read live restored
+        // layer bounds and map that local rectangle back to document coordinates.
+        var layerBounds = doc.descToObject(lr.getProperty('boundsNoEffects', false, id));
+        if (!layerBounds || !(Number(layerBounds.width) > 0) || !(Number(layerBounds.height) > 0)) return null;
+        var sx = Number(layerBounds.width) / Number(analysis.width),
+            sy = Number(layerBounds.height) / Number(analysis.height),
+            b = analysis.bbox,
+            subject = {
+                left: Number(layerBounds.left) + Number(b[0]) * sx,
+                top: Number(layerBounds.top) + Number(b[1]) * sy,
+                right: Number(layerBounds.left) + Number(b[2]) * sx,
+                bottom: Number(layerBounds.top) + Number(b[3]) * sy,
+                faces: fromPython ? (Number(analysis.faces) || 0) : 0
+            };
+        subject.width = subject.right - subject.left;
+        subject.height = subject.bottom - subject.top;
+        if (!(subject.width > 1) || !(subject.height > 1)) return null;
+        subject.center = { y: subject.top + subject.height / 2, x: subject.left + subject.width / 2 };
+        subject.vertical = subject.height > subject.width;
+        subject.ratio = subject.width / subject.height;
+        return finishSubjectGeometry(subject, layerBounds);
+    } catch (e) {
+        return null;
+    }
+}
+
+function subjectFromLayerBounds(id) {
+    var b = doc.descToObject(lr.getProperty('boundsNoEffects', false, id));
+    if (!b || !(Number(b.width) > 0) || !(Number(b.height) > 0)) return null;
+    var subject = {
+        top: Number(b.top), left: Number(b.left), right: Number(b.right), bottom: Number(b.bottom),
+        width: Number(b.width), height: Number(b.height), faces: 0
+    };
+    subject.center = { y: subject.top + subject.height / 2, x: subject.left + subject.width / 2 };
+    subject.vertical = subject.height > subject.width;
+    subject.ratio = subject.width / subject.height;
+    // Layer-bounds mode has no object offsets: the complete layer is the geometry.
+    subject.layer = b;
+    subject.layer.center = { y: Number(b.top) + Number(b.height) / 2, x: Number(b.left) + Number(b.width) / 2 };
+    return subject;
+}
+
+function findClippingBaseId(id) {
+    // Follow the real clipping chain downward. The first layer that is not
+    // clipped is the base layer for this clipping group. Using backwardEnum
+    // avoids assumptions about Photoshop itemIndex direction/background offsets.
+    var currentId = id, guard = 0;
+    try {
+        lr.selectLayer(currentId, false);
+        while (guard++ < 1000) {
+            var belowId = previousLayer.getProperty('layerID');
+            if (!belowId || String(belowId) == String(currentId)) return null;
+            if (!lr.getProperty('group', false, belowId)) return belowId;
+            currentId = belowId;
+            lr.selectLayer(currentId, false);
+        }
+    } catch (e) { }
+    return null;
+}
+
+function getBottomMostSelectedLayerId(ids) {
+    // Photoshop itemIndex grows from the bottom of the layer stack upward
+    // (background is 0/1 depending on document structure), so the smallest
+    // itemIndex is the bottom-most selected layer.
+    var bestId = null, bestIndex = Infinity;
+    for (var i = 0; i < ids.length; i++) {
+        var idx = Number(lr.getProperty('itemIndex', false, ids[i]));
+        if (idx < bestIndex) {
+            bestIndex = idx;
+            bestId = ids[i];
+        }
+    }
+    return bestId;
+}
+
+function prepareFrameList() {
+    runCtx.frames = [];
+
+    if (runCtx.allClippedAtStart) {
+        var seenBases = {};
+        for (var cs = 0; cs < runCtx.subjects.length; cs++) {
+            var cm = runCtx.layerMeta[String(runCtx.subjects[cs].id)],
+                baseId = cm ? cm.clippingBaseId : null;
+            if (!baseId) throw new Error('Cannot find clipping base for layer: ' + (cm ? cm.name : runCtx.subjects[cs].id));
+            if (!seenBases[String(baseId)]) {
+                seenBases[String(baseId)] = true;
+                runCtx.frames.push(baseId);
+            }
+        }
+        return;
+    }
+
+    // Normal/fallback choice was already made before object detection.
+    for (var i = 0; i < runCtx.plannedFrames.length; i++) runCtx.frames.push(runCtx.plannedFrames[i]);
+}
+
+function readFramesStage() {
+    var n = runCtx.frames.length,
+        slice = 1 / Math.max(1, n);
+    if (!n) {
+        app.changeProgressText(L(str.readFrames) + ': 0/0');
+        return;
+    }
+    for (var i = 0; i < n; i++) app.doProgressTask(slice, 'readFrameChunk(' + i + ');');
+    runCtx.frames.sort(function (a, b) { return a.ratio > b.ratio ? 1 : -1; });
+}
+
+function readFrameChunk(i) {
+    var id = runCtx.frames[i],
+        frameName = lr.getProperty('name', false, id),
+        text = L(str.readFrames) + ': ' + (i + 1) + '/' + runCtx.frames.length + ' \u2014 ' + frameName;
+
+    doc.makeSelection(id, lr.getProperty('hasVectorMask', false, id) && !(lr.hasProperty('vectorMaskEmpty', id) ? lr.getProperty('vectorMaskEmpty', false, id) : true));
+    doc.setQuickMask(true);
+    doc.levels([128, 1, 240]);
+    doc.setQuickMask();
+    doc.createPath();
+    doc.makeSelectionFromPath();
+    doc.deleteCurrentPath();
+    var frame = doc.descToObject(doc.getProperty('selection'));
+    doc.deselect();
+    with (frame) {
+        frame.height = bottom - top;
+        frame.width = right - left;
+        frame.center = { y: top + height / 2, x: left + width / 2 };
+        frame.vertical = bottom - top > right - left;
+        frame.ratio = width / height;
+        frame.area = width * height;
+    }
+    frame.color = lr.getProperty('color', false, id)[1];
+    frame.id = lr.getProperty('layerID', false, id);
+    runCtx.frames[i] = frame;
+    app.changeProgressText(text);
+    $.sleep(0);
+}
+
+function matchFramesStage() {
+    app.changeProgressText(L(str.matchFrames));
+    if (runCtx.selectedFallback || runCtx.allClippedAtStart) {
+        runCtx.assignments = null;
+        return;
+    }
+    if (cfg.engine == 'python') {
+        var matchSubjects = [], matchFrames = [];
+        for (var i = 0; i < runCtx.subjects.length; i++) {
+            matchSubjects.push({
+                id: runCtx.subjects[i].id,
+                color: runCtx.subjects[i].color,
+                ratio: runCtx.subjects[i].ratio,
+                faces: runCtx.subjects[i].faces ? runCtx.subjects[i].faces : 0,
+                bbox_area: runCtx.subjects[i].width * runCtx.subjects[i].height
+            });
+        }
+        for (var j = 0; j < runCtx.frames.length; j++) {
+            matchFrames.push({ id: runCtx.frames[j].id, color: runCtx.frames[j].color, ratio: runCtx.frames[j].ratio, area: runCtx.frames[j].area });
+        }
+        var matched = afApi.sendPayload('match', { subjects: matchSubjects, frames: matchFrames }, MATCH_DELAY);
+        if (!matched || !matched.assignments) throw new Error('Python returned an invalid frame-matching response.');
+        runCtx.assignments = {};
+        for (var mi = 0; mi < matched.assignments.length; mi++) {
+            runCtx.assignments[String(matched.assignments[mi].subject_id)] = matched.assignments[mi].frame_id;
+        }
+    } else {
+        runCtx.assignments = matchByRatio(runCtx.subjects, runCtx.frames);
+    }
+    validateAssignments(runCtx.assignments, runCtx.subjects);
+}
+
+function validateAssignments(assignments, subjects) {
+    var missingByColor = {}, firstUnexpected = null;
+    for (var i = 0; i < subjects.length; i++) {
+        if (!assignments || assignments[String(subjects[i].id)] == undefined) {
+            var color = String(subjects[i].color),
+                name = runCtx.layerMeta[String(subjects[i].id)] ? runCtx.layerMeta[String(subjects[i].id)].name : subjects[i].id;
+            missingByColor[color] = (missingByColor[color] || 0) + 1;
+            if (!firstUnexpected) firstUnexpected = name;
+        }
+    }
+    for (var c in missingByColor) {
+        var allowed = runCtx.allowUnmatched ? Number(runCtx.allowedMissingByColor[c] || 0) : 0;
+        if (missingByColor[c] > allowed) {
+            throw new Error(L(str.errMatching) + ': ' + firstUnexpected);
+        }
+    }
+}
+
+function alignSubjectsStage() {
+    var n = runCtx.subjects.length,
+        slice = 1 / Math.max(1, n);
+    for (var i = 0; i < n; i++) app.doProgressTask(slice, 'alignSubjectChunk(' + i + ');');
+}
+
+function alignSubjectChunk(i) {
+    var subject = runCtx.subjects[i],
+        layerName = lr.getProperty('name', false, subject.id),
+        text = L(str.align) + ': ' + (i + 1) + '/' + runCtx.subjects.length + ' \u2014 ' + layerName,
+        frame = null;
+
+    if (runCtx.allClippedAtStart) {
+        // Preserve the user's existing clipping structure. Each subject uses its
+        // own real clipping-base frame; colors and global matching are irrelevant.
+        var meta = runCtx.layerMeta[String(subject.id)],
+            baseId = meta ? meta.clippingBaseId : null;
+        frame = baseId ? findFrameById(runCtx.frames, baseId) : null;
+        if (!frame) throw new Error('Cannot read clipping-base frame for layer: ' + layerName);
+        lr.selectLayer(subject.id);
+        if (cfg.engine == 'layer') alignLayerBounds(subject, frame); else alignLayer(subject, frame);
+    } else {
+        if (runCtx.selectedFallback) {
+            frame = runCtx.frames.length ? runCtx.frames[0] : null;
+        } else if (runCtx.assignments && runCtx.assignments[String(subject.id)] != undefined) {
+            frame = findFrameById(runCtx.frames, runCtx.assignments[String(subject.id)]);
+        }
+        // In the user-approved shortage case, an unmatched layer deliberately
+        // stays exactly where it was.
+        if (frame) moveAndAlignSubject(subject, frame);
+    }
+    app.changeProgressText(text);
+    $.sleep(0);
+}
+
+function moveAndAlignSubject(subject, frame) {
+    var offset = doc.getProperty('hasBackgroundLayer') ? 1 : 0,
+        subjectIdx = lr.getProperty('itemIndex', false, subject.id) - offset,
+        frameIdx = lr.getProperty('itemIndex', false, frame.id) - offset;
+
+    doc.moveLayer(subjectIdx, subjectIdx > frameIdx ? frameIdx + offset : frameIdx - !offset);
+    lr.selectLayer(subject.id);
+
+    // Layer-bounds Cover must be computed before clipping changes visible bounds.
+    // Object-based engines keep the original order from the source script.
+    if (cfg.engine == 'layer') {
+        alignLayerBounds(subject, frame);
+        if (!lr.getProperty('group', false, subject.id)) lr.groupCurrentLayer();
+    } else {
+        if (!lr.getProperty('group', false, subject.id)) lr.groupCurrentLayer();
+        alignLayer(subject, frame);
+    }
+}
+
+function undoPreviewHistory(sourceDoc) {
+    app.activeDocument = sourceDoc;
+    executeAction(charIDToTypeID('undo'), undefined, DialogModes.NO);
+    app.activeDocument = sourceDoc;
+}
+
+function matchByRatio(subjects, frames) {
+    var groups = {}, result = {};
+    for (var i = 0; i < subjects.length; i++) {
+        var sc = String(subjects[i].color);
+        if (!groups[sc]) groups[sc] = { subjects: [], frames: [] };
+        groups[sc].subjects.push(subjects[i]);
+    }
+    for (var j = 0; j < frames.length; j++) {
+        var fc = String(frames[j].color);
+        if (!groups[fc]) groups[fc] = { subjects: [], frames: [] };
+        groups[fc].frames.push(frames[j]);
+    }
+    for (var key in groups) {
+        var gs = groups[key].subjects, gf = groups[key].frames;
+        if (!gs.length || !gf.length) continue;
+        var matrix = [];
+        for (var si = 0; si < gs.length; si++) {
+            var row = [], sr = Math.max(1e-6, Number(gs[si].ratio) || 1), sv = sr < 1;
+            for (var fi = 0; fi < gf.length; fi++) {
+                var fr = Math.max(1e-6, Number(gf[fi].ratio) || 1), fv = fr < 1;
+                row.push(Math.abs(Math.log(sr / fr)) * 12 + (sv != fv ? 4 : 0));
+            }
+            matrix.push(row);
+        }
+        var assignment = hungarian(matrix);
+        for (var ai = 0; ai < assignment.length; ai++) {
+            if (assignment[ai] >= 0) result[String(gs[ai].id)] = gf[assignment[ai]].id;
+        }
+    }
+    return result;
+}
+
+function hungarian(cost) {
+    var n = cost.length;
+    if (!n) return [];
+    var m = cost[0].length;
+    if (!m) { var empty = []; for (var e = 0; e < n; e++) empty.push(-1); return empty; }
+    if (n > m) {
+        var transposed = [];
+        for (var j = 0; j < m; j++) {
+            var row = [];
+            for (var i = 0; i < n; i++) row.push(cost[i][j]);
+            transposed.push(row);
+        }
+        var ta = hungarian(transposed), out = [];
+        for (var oi = 0; oi < n; oi++) out.push(-1);
+        for (var r = 0; r < ta.length; r++) if (ta[r] >= 0) out[ta[r]] = r;
+        return out;
+    }
+    var u = [], v = [], p = [], way = [];
+    for (var z = 0; z <= n; z++) u.push(0);
+    for (var z2 = 0; z2 <= m; z2++) { v.push(0); p.push(0); way.push(0); }
+    for (var ii = 1; ii <= n; ii++) {
+        p[0] = ii;
+        var j0 = 0, minv = [], used = [];
+        for (var jj = 0; jj <= m; jj++) { minv.push(Infinity); used.push(false); }
+        do {
+            used[j0] = true;
+            var i0 = p[j0], delta = Infinity, j1 = 0;
+            for (var jx = 1; jx <= m; jx++) {
+                if (used[jx]) continue;
+                var cur = Number(cost[i0 - 1][jx - 1]) - u[i0] - v[jx];
+                if (cur < minv[jx]) { minv[jx] = cur; way[jx] = j0; }
+                if (minv[jx] < delta) { delta = minv[jx]; j1 = jx; }
+            }
+            for (var jx2 = 0; jx2 <= m; jx2++) {
+                if (used[jx2]) { u[p[jx2]] += delta; v[jx2] -= delta; }
+                else minv[jx2] -= delta;
+            }
+            j0 = j1;
+        } while (p[j0] != 0);
+        do {
+            var jprev = way[j0];
+            p[j0] = p[jprev];
+            j0 = jprev;
+        } while (j0 != 0);
+    }
+    var assignment = [];
+    for (var a = 0; a < n; a++) assignment.push(-1);
+    for (var jm = 1; jm <= m; jm++) if (p[jm] != 0) assignment[p[jm] - 1] = jm - 1;
+    return assignment;
+}
+
+function getCapabilities() {
+    var v = parsePhotoshopVersion(app.version),
+        hasAuto = versionAtLeast(v, 19, 1),
+        hasCloud = versionAtLeast(v, 23, 5);
+    return {
+        version: v,
+        python: false,
+        autoCutout: hasAuto,
+        cloud: hasAuto && hasCloud,
+        selectionProcessingModes: hasCloud
+    };
+}
+
+function parsePhotoshopVersion(s) {
+    var m = String(s).match(/^(\d+)(?:\.(\d+))?/);
+    return m ? { major: Number(m[1]), minor: Number(m[2] || 0) } : { major: 0, minor: 0 };
+}
+
+function versionAtLeast(v, major, minor) {
+    return v.major > major || (v.major == major && v.minor >= minor);
+}
+
+function pythonFilesAvailable(api, runtime) {
+    try {
+        return !!(api && api.exists && runtime &&
+            runtime.pythonw && runtime.pythonw.exists &&
+            runtime.launcher && runtime.launcher.exists &&
+            runtime.humanModel && runtime.humanModel.exists && runtime.humanModel.length >= 5000000 &&
+            runtime.faceModel && runtime.faceModel.exists && runtime.faceModel.length >= 200000);
+    } catch (e) {
+        return false;
+    }
+}
+
+function availableEngines() {
+    var a = [];
+    if (capabilities.python) a.push('python');
+    if (capabilities.autoCutout) a.push('device');
+    if (capabilities.cloud) a.push('cloud');
+    a.push('layer');
+    return a;
+}
+
+function engineIsAvailable(key) {
+    var a = availableEngines();
+    for (var i = 0; i < a.length; i++) if (a[i] == key) return true;
+    return false;
+}
+
+function bestDefaultEngine() {
+    if (capabilities.python) return 'python';
+    if (capabilities.autoCutout) return 'device';
+    return 'layer';
+}
+
+function engineLabel(key) {
+    if (key == 'python') return L(str.enginePython);
+    if (key == 'device') return L(str.engineDevice);
+    if (key == 'cloud') return L(str.engineCloud);
+    return L(str.engineLayer);
+}
+
+function engineDescription(key) {
+    if (key == 'python') return L(str.descPython);
+    if (key == 'device') return L(str.descDevice);
+    if (key == 'cloud') return L(str.descCloud);
+    return L(str.descLayer);
+}
+
+function makeUserCancelError() {
+    var e = new Error('User cancelled');
+    e.number = 8007;
+    return e;
+}
+
+function showFrameShortageWarning(shortage, missingTotal, totalLayers) {
+    var dlg = new Window("dialog{orientation:'column',alignChildren:['fill','top'],spacing:10,margins:16}"),
+        msg = dlg.add("statictext{properties:{multiline:true},preferredSize:[430,125]}"),
+        details = dlg.add("statictext{properties:{multiline:true},preferredSize:[430,70]}"),
+        buttons = dlg.add("group{orientation:'row',alignment:['center','top'],spacing:10}"),
+        proceed = buttons.add('button', undefined, L(str.continueButton), { name: 'ok' }),
+        stop = buttons.add('button', undefined, L(str.stopButton), { name: 'cancel' });
+    dlg.text = L(str.warningTitle);
+    msg.text = L(str.warnFrameCount).replace('%MISSING%', missingTotal).replace('%TOTAL%', totalLayers);
+    details.text = L(str.warnFrameDetails) + '\n' + shortage.join(', ');
+    return dlg.show() == 1;
+}
+
+function dialog(actionMode) {
+    var dlg = new Window("dialog{orientation:'column',alignChildren:['fill','top'],spacing:10,margins:16}"),
+        pnEngine = dlg.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:8,margins:10}"),
+        dlEngine = pnEngine.add('dropdownlist'),
+        stDesc = pnEngine.add("statictext{properties:{multiline:true},preferredSize:[390,72]}"),
+        pnMargins = dlg.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:6,margins:[10,18,10,10]}"),
+        stVertical = pnMargins.add('statictext'),
+        rowVT = addSliderRow(pnMargins, L(str.topOffset), 0, 20, cfg.vTop),
+        rowVB = addSliderRow(pnMargins, L(str.bottomOffset), 0, 20, cfg.vBottom),
+        rowVS = addSliderRow(pnMargins, L(str.sideOffset), 0, 20, cfg.vSide),
+        stHorizontal = pnMargins.add('statictext'),
+        rowHT = addSliderRow(pnMargins, L(str.topOffset), 0, 20, cfg.hTop),
+        rowHB = addSliderRow(pnMargins, L(str.bottomOffset), 0, 20, cfg.hBottom),
+        rowHS = addSliderRow(pnMargins, L(str.sideOffset), 0, 20, cfg.hSide),
+        buttons = dlg.add("group{orientation:'row',alignment:['center','top'],spacing:10}"),
+        ok = buttons.add('button', undefined, actionMode ? L(str.save) : L(str.okButton), { name: 'ok' }),
+        cancel = buttons.add('button', undefined, L(str.cancel), { name: 'cancel' });
+
+    dlg.text = L(str.title) + ' ' + SCRIPT_VERSION;
+    pnEngine.text = L(str.enginePanel);
+    pnMargins.text = L(str.offsetPanel);
+    stVertical.text = L(str.verticalFrame);
+    stHorizontal.text = L(str.horizontalFrame);
+
+    var engines = availableEngines();
+    for (var i = 0; i < engines.length; i++) {
+        var item = dlEngine.add('item', engineLabel(engines[i]));
+        item.engineKey = engines[i];
+    }
+
+    function selectEngine(key) {
+        for (var i = 0; i < dlEngine.items.length; i++) {
+            if (dlEngine.items[i].engineKey == key) { dlEngine.selection = i; return; }
+        }
+        dlEngine.selection = 0;
+    }
+    function updateEngineUI() {
+        var key = dlEngine.selection ? dlEngine.selection.engineKey : cfg.engine;
+        stDesc.text = engineDescription(key);
+        pnMargins.enabled = key != 'layer';
+    }
+
+    selectEngine(cfg.engine);
+    updateEngineUI();
+
+    dlEngine.onChange = function () {
+        if (!this.selection) return;
+        cfg.engine = this.selection.engineKey;
+        updateEngineUI();
+    };
+
+    bindSlider(rowVT, function (v) { cfg.vTop = v; });
+    bindSlider(rowVB, function (v) { cfg.vBottom = v; });
+    bindSlider(rowVS, function (v) { cfg.vSide = v; });
+    bindSlider(rowHT, function (v) { cfg.hTop = v; });
+    bindSlider(rowHB, function (v) { cfg.hBottom = v; });
+    bindSlider(rowHS, function (v) { cfg.hSide = v; });
+
+    dlg.onShow = function () {
+        ok.enabled = actionMode ? true : !!apl.getProperty('numberOfDocuments');
+    };
+    return dlg;
+}
+
+function addSliderRow(parent, label, minv, maxv, value) {
+    var row = parent.add("group{orientation:'column',alignChildren:['fill','center'],spacing:1,margins:0}"),
+        title = row.add("group{orientation:'row',alignChildren:['fill','center'],spacing:5,margins:0}"),
+        st = title.add('statictext'),
+        val = title.add("statictext{preferredSize:[55,-1],justify:'right'}"),
+        sl = row.add('slider', undefined, value, minv, maxv);
+    st.text = label;
+    sl.preferredSize = [390, -1];
+    val.text = formatPercent(value);
+    row.slider = sl;
+    row.valueText = val;
+    return row;
+}
+
+function bindSlider(row, setter) {
+    row.slider.onChanging = function () {
+        var v = Math.round(this.value * 2) / 2;
+        row.valueText.text = formatPercent(v);
+        setter(v);
+    };
+    row.slider.onChange = row.slider.onChanging;
+}
+
+function formatPercent(v) {
+    return (Math.round(Number(v) * 10) / 10) + '%';
+}
+
+function Config() {
+    var settingsObj = this;
+    this.engine = '';
+    // Defaults exactly reproduce the original hard-coded margins.
+    this.vTop = 5;
+    this.vBottom = 10;
+    this.vSide = 5;
+    this.hTop = 10;
+    this.hBottom = 5;
+    this.hSide = 10;
+
+    this.resolveEngine = function () {
+        if (!engineIsAvailable(this.engine)) this.engine = bestDefaultEngine();
+    };
+
+    // Same playbackParameters scheme as Face alignment.jsx:
+    // persistent defaults come from Custom Options, Action playback comes from
+    // Photoshop's playbackParameters descriptor.
+    this.getScriptSettings = function (fromAction) {
+        var d;
+        if (fromAction) {
+            try { d = playbackParameters; } catch (e0) { d = undefined; }
+        } else {
+            try { d = getCustomOptions(UUID); } catch (e1) { d = undefined; }
+        }
+        if (d != undefined) descriptorToObject(settingsObj, d);
+        this.resolveEngine();
+
+        function descriptorToObject(o, desc) {
+            var l = desc.count;
+            for (var i = 0; i < l; i++) {
+                var k = desc.getKey(i),
+                    t = desc.getType(k),
+                    key = app.typeIDToStringID(k);
+                // Photoshop may add the terminology marker to playbackParameters.
+                // As in Face alignment.jsx, it is not part of Config itself.
+                if (!(key in o)) continue;
+                switch (t) {
+                    case DescValueType.BOOLEANTYPE: o[key] = desc.getBoolean(k); break;
+                    case DescValueType.STRINGTYPE: o[key] = desc.getString(k); break;
+                    case DescValueType.DOUBLETYPE: o[key] = desc.getDouble(k); break;
+                    case DescValueType.INTEGERTYPE: o[key] = desc.getInteger(k); break;
+                }
+            }
+        }
+    };
+
+    this.putScriptSettings = function (toAction) {
+        var d = objectToDescriptor(settingsObj);
+        if (toAction) playbackParameters = d;
+        else putCustomOptions(UUID, d, true);
+
+        function objectToDescriptor(o) {
+            var desc = new ActionDescriptor(),
+                keys = ['engine', 'vTop', 'vBottom', 'vSide', 'hTop', 'hBottom', 'hSide'];
+
+            for (var i = 0; i < keys.length; i++) {
+                var key = keys[i], id = app.stringIDToTypeID(key), value = o[key];
+                switch (typeof value) {
+                    case 'boolean': desc.putBoolean(id, value); break;
+                    case 'string': desc.putString(id, value); break;
+                    case 'number': desc.putDouble(id, value); break;
+                }
+            }
+            return desc;
+        }
+    };
+}
+function Locale() {
+    this.title = { ru: '\u0412\u044B\u0440\u0430\u0432\u043D\u0438\u0432\u0430\u043D\u0438\u0435 \u0438 \u0432\u043F\u0438\u0441\u044B\u0432\u0430\u043D\u0438\u0435', en: 'Align and fit layers' };
+    this.err = { ru: '\u0421\u043A\u0440\u0438\u043F\u0442 \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D', en: 'Script stopped' };
+    this.errDoc = { ru: '\u041D\u0435\u0442 \u0430\u043A\u0442\u0438\u0432\u043D\u043E\u0433\u043E \u0434\u043E\u043A\u0443\u043C\u0435\u043D\u0442\u0430!', en: 'No active document!' };
+    this.errLayers = { ru: '\u041D\u0435 \u0432\u044B\u0431\u0440\u0430\u043D\u044B \u0441\u043B\u043E\u0438 \u0434\u043B\u044F \u0432\u044B\u0440\u0430\u0432\u043D\u0438\u0432\u0430\u043D\u0438\u044F.', en: 'No layers are selected for alignment.' };
+    this.errNoSubject = { ru: 'Photoshop \u043D\u0435 \u0441\u043C\u043E\u0433 \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u0438\u0442\u044C \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u043E\u0431\u044A\u0435\u043A\u0442\u0430', en: 'Photoshop could not detect object bounds' };
+    this.errLayerBounds = { ru: '\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u044C \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u0441\u043B\u043E\u044F', en: 'Cannot read layer bounds' };
+    this.errCloudMode = { ru: '\u041E\u0431\u043B\u0430\u0447\u043D\u044B\u0439 Select Subject \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D \u0432 \u044D\u0442\u043E\u0439 \u0432\u0435\u0440\u0441\u0438\u0438 Photoshop.', en: 'Cloud Select Subject is not available in this Photoshop version.' };
+    this.errFallbackFrame = { ru: '\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u0438\u0442\u044C \u043D\u0438\u0436\u043D\u0438\u0439 \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u044B\u0439 \u0441\u043B\u043E\u0439 \u0434\u043B\u044F fallback.', en: 'Cannot determine the bottom-most selected layer for fallback.' };
+    this.errFallbackClipped = { ru: '\u041D\u0435\u043B\u044C\u0437\u044F \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u044C fallback: \u0441\u0430\u043C\u044B\u0439 \u043D\u0438\u0436\u043D\u0438\u0439 \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u044B\u0439 \u0441\u043B\u043E\u0439 \u0443\u0436\u0435 \u043D\u0430\u0445\u043E\u0434\u0438\u0442\u0441\u044F \u0432 clipping. \u0420\u0430\u0431\u043E\u0442\u0430 \u0441\u043A\u0440\u0438\u043F\u0442\u0430 \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D\u0430.', en: 'Fallback cannot be used because the bottom-most selected layer is already clipped. The script has been stopped.' };
+    this.errMatching = { ru: '\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u0434\u043E\u0431\u0440\u0430\u0442\u044C \u0440\u0430\u043C\u043A\u0443 \u0434\u043B\u044F \u0441\u043B\u043E\u044F', en: 'Could not assign a frame to layer' };
+    this.warningTitle = { ru: '\u041D\u0435\u0445\u0432\u0430\u0442\u043A\u0430 \u0440\u0430\u043C\u043E\u043A', en: 'Missing frames' };
+    this.warnFrameCount = { ru: '\u041D\u0435 \u0445\u0432\u0430\u0442\u0430\u0435\u0442 \u0440\u0430\u043C\u043E\u043A \u0441 \u0441\u043E\u043E\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u044E\u0449\u0438\u043C\u0438 \u0446\u0432\u0435\u0442\u043E\u0432\u044B\u043C\u0438 \u043C\u0435\u0442\u043A\u0430\u043C\u0438: %MISSING% \u0438\u0437 %TOTAL%.\n\n\u0415\u0441\u043B\u0438 \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0438\u0442\u044C, \u0441\u043A\u0440\u0438\u043F\u0442 \u043E\u0431\u0440\u0430\u0431\u043E\u0442\u0430\u0435\u0442 \u0441\u043B\u043E\u0438, \u0434\u043B\u044F \u043A\u043E\u0442\u043E\u0440\u044B\u0445 \u0435\u0441\u0442\u044C \u0440\u0430\u043C\u043A\u0438. \u041E\u0441\u0442\u0430\u043B\u044C\u043D\u044B\u0435 \u0441\u043B\u043E\u0438 \u043E\u0441\u0442\u0430\u043D\u0443\u0442\u0441\u044F \u043D\u0430 \u0438\u0441\u0445\u043E\u0434\u043D\u044B\u0445 \u043F\u043E\u0437\u0438\u0446\u0438\u044F\u0445.', en: 'There are not enough frames with matching color labels: %MISSING% of %TOTAL%.\n\nIf you continue, the script will process layers that have matching frames. The remaining layers will stay in their original positions.' };
+    this.warnFrameDetails = { ru: '\u041F\u043E \u0446\u0432\u0435\u0442\u043E\u0432\u044B\u043C \u043C\u0435\u0442\u043A\u0430\u043C:', en: 'By color label:' };
+    this.continueButton = { ru: '\u041F\u0440\u043E\u0434\u043E\u043B\u0436\u0438\u0442\u044C', en: 'Continue' };
+    this.stopButton = { ru: '\u041E\u0441\u0442\u0430\u043D\u043E\u0432\u0438\u0442\u044C', en: 'Stop' };
+    this.progressTitle = { ru: '\u0412\u044B\u0440\u0430\u0432\u043D\u0438\u0432\u0430\u043D\u0438\u0435 \u0438 \u0432\u043F\u0438\u0441\u044B\u0432\u0430\u043D\u0438\u0435', en: 'Align and fit layers' };
+    this.startPython = { ru: '\u0417\u0430\u043F\u0443\u0441\u043A Python...', en: 'Starting Python...' };
+    this.prepareImages = { ru: '\u041F\u043E\u0434\u0433\u043E\u0442\u043E\u0432\u043A\u0430 \u0438\u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u0438\u0439', en: 'Prepare images' };
+    this.restoreLayers = { ru: '\u0412\u043E\u0441\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 \u0441\u043B\u043E\u0451\u0432...', en: 'Restore layers...' };
+    this.analyzePython = { ru: '\u0410\u043D\u0430\u043B\u0438\u0437 \u0438\u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u0438\u0439 Python...', en: 'Analyze images in Python...' };
+    this.detectBounds = { ru: '\u0413\u0440\u0430\u043D\u0438\u0446\u044B \u043E\u0431\u044A\u0435\u043A\u0442\u0430', en: 'Object bounds' };
+    this.readFrames = { ru: '\u0427\u0442\u0435\u043D\u0438\u0435 \u0440\u0430\u043C\u043E\u043A', en: 'Read frames' };
+    this.matchFrames = { ru: '\u0421\u043E\u0433\u043B\u0430\u0441\u043E\u0432\u0430\u043D\u0438\u0435 \u0440\u0430\u043C\u043E\u043A...', en: 'Match frames...' };
+    this.align = { ru: '\u0412\u044B\u0440\u0430\u0432\u043D\u0438\u0432\u0430\u043D\u0438\u0435', en: 'Align' };
+    this.done = { ru: '\u0413\u043E\u0442\u043E\u0432\u043E', en: 'Done' };
+    this.enginePanel = { ru: '\u041E\u043F\u0440\u0435\u0434\u0435\u043B\u0435\u043D\u0438\u0435 \u0433\u0440\u0430\u043D\u0438\u0446 \u043E\u0431\u044A\u0435\u043A\u0442\u0430', en: 'Object bounds engine' };
+    this.offsetPanel = { ru: '\u041E\u0442\u0441\u0442\u0443\u043F\u044B \u043E\u0431\u044A\u0435\u043A\u0442\u0430 \u043E\u0442 \u0440\u0430\u043C\u043A\u0438, %', en: 'Object margins inside frame, %' };
+    this.verticalFrame = { ru: '\u0412\u0435\u0440\u0442\u0438\u043A\u0430\u043B\u044C\u043D\u0430\u044F \u0440\u0430\u043C\u043A\u0430', en: 'Vertical frame' };
+    this.horizontalFrame = { ru: '\u0413\u043E\u0440\u0438\u0437\u043E\u043D\u0442\u0430\u043B\u044C\u043D\u0430\u044F \u0440\u0430\u043C\u043A\u0430', en: 'Horizontal frame' };
+    this.topOffset = { ru: '\u0421\u0432\u0435\u0440\u0445\u0443', en: 'Top' };
+    this.bottomOffset = { ru: '\u0421\u043D\u0438\u0437\u0443', en: 'Bottom' };
+    this.sideOffset = { ru: '\u041F\u043E \u0431\u043E\u043A\u0430\u043C', en: 'Sides' };
+    this.okButton = { ru: '\u0412\u044B\u043F\u043E\u043B\u043D\u0438\u0442\u044C', en: 'Run' };
+    this.save = { ru: '\u0421\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438', en: 'Save settings' };
+    this.cancel = { ru: '\u041E\u0442\u043C\u0435\u043D\u0430', en: 'Cancel' };
+    this.enginePython = { ru: 'Python', en: 'Python' };
+    this.engineDevice = { ru: 'autoCutout \u2014 on device', en: 'autoCutout \u2014 on device' };
+    this.engineCloud = { ru: 'autoCutout \u2014 in cloud', en: 'autoCutout \u2014 in cloud' };
+    this.engineLayer = { ru: '\u0413\u0440\u0430\u043D\u0438\u0446\u044B \u0441\u043B\u043E\u044F', en: 'Layer bounds' };
+    this.descPython = {
+        ru: '\u0411\u044B\u0441\u0442\u0440\u044B\u0439 \u0430\u043D\u0430\u043B\u0438\u0437 \u0443\u043C\u0435\u043D\u044C\u0448\u0435\u043D\u043D\u044B\u0445 \u0438\u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u0438\u0439 \u0432\u043D\u0435\u0448\u043D\u0438\u043C \u043C\u043E\u0434\u0443\u043B\u0435\u043C. \u041E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442 \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u0433\u0440\u0443\u043F\u043F\u044B \u0438 \u043F\u0440\u0438\u043C\u0435\u0440\u043D\u043E\u0435 \u0447\u0438\u0441\u043B\u043E \u043B\u0438\u0446. \u0427\u0438\u0441\u043B\u043E \u043B\u0438\u0446 \u0434\u043E\u043F\u043E\u043B\u043D\u0438\u0442\u0435\u043B\u044C\u043D\u043E \u0443\u0447\u0438\u0442\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u043F\u0440\u0438 \u0440\u0430\u0441\u043F\u0440\u0435\u0434\u0435\u043B\u0435\u043D\u0438\u0438 \u043A\u0430\u0434\u0440\u043E\u0432 \u043F\u043E \u0440\u0430\u0437\u043C\u0435\u0440\u0443 \u0440\u0430\u043C\u043E\u043A.',
+        en: 'Fast external analysis of reduced previews. Detects the group bounds and an approximate face count. Face count is also used when matching photos to frame sizes.'
+    };
+    this.descDevice = {
+        ru: 'Photoshop Select Subject: \u043E\u0431\u0440\u0430\u0431\u043E\u0442\u043A\u0430 \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u043E \u043D\u0430 \u0443\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432\u0435. \u0411\u044B\u0441\u0442\u0440\u0435\u0435 Cloud, \u043D\u043E \u043E\u0431\u044B\u0447\u043D\u043E \u043C\u0435\u043D\u0435\u0435 \u0442\u043E\u0447\u043D\u043E \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442 \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u043E\u0431\u044A\u0435\u043A\u0442\u0430. \u0427\u0438\u0441\u043B\u043E \u043B\u0438\u0446 \u043D\u0435 \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442\u0441\u044F.',
+        en: 'Photoshop Select Subject processed locally on the device. Faster than Cloud, but usually less accurate at determining object bounds. Face count is not detected.'
+    };
+    this.descCloud = {
+        ru: 'Photoshop Select Subject: \u043E\u0431\u0440\u0430\u0431\u043E\u0442\u043A\u0430 \u0432 \u043E\u0431\u043B\u0430\u043A\u0435. \u041C\u0435\u0434\u043B\u0435\u043D\u043D\u0435\u0435 Device, \u043D\u043E \u043E\u0431\u044B\u0447\u043D\u043E \u0442\u043E\u0447\u043D\u0435\u0435 \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442 \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u043E\u0431\u044A\u0435\u043A\u0442\u0430. \u0427\u0438\u0441\u043B\u043E \u043B\u0438\u0446 \u043D\u0435 \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442\u0441\u044F; \u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u0438\u043D\u0442\u0435\u0440\u043D\u0435\u0442.',
+        en: 'Photoshop Select Subject processed in the cloud. Slower than Device, but usually more accurate at determining object bounds. Face count is not detected; internet access is required.'
+    };
+    this.descLayer = {
+        ru: '\u0411\u0435\u0437 \u0434\u0435\u0442\u0435\u043A\u0446\u0438\u0438 \u043E\u0431\u044A\u0435\u043A\u0442\u043E\u0432 \u0438 \u043B\u0438\u0446. \u0421\u043B\u043E\u0438 \u0438 \u0440\u0430\u043C\u043A\u0438 \u0441\u043E\u0433\u043B\u0430\u0441\u0443\u044E\u0442\u0441\u044F \u043F\u043E \u043F\u0440\u043E\u043F\u043E\u0440\u0446\u0438\u044F\u043C; \u0437\u0430\u0442\u0435\u043C \u0432\u0435\u0441\u044C \u0441\u043B\u043E\u0439 \u0446\u0435\u043D\u0442\u0440\u0438\u0440\u0443\u0435\u0442\u0441\u044F \u0438 \u043C\u0430\u0441\u0448\u0442\u0430\u0431\u0438\u0440\u0443\u0435\u0442\u0441\u044F \u0442\u0430\u043A, \u0447\u0442\u043E\u0431\u044B \u0433\u0430\u0440\u0430\u043D\u0442\u0438\u0440\u043E\u0432\u0430\u043D\u043D\u043E \u043F\u0435\u0440\u0435\u043A\u0440\u044B\u0442\u044C \u0440\u0430\u043C\u043A\u0443. \u041D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438 \u043E\u0442\u0441\u0442\u0443\u043F\u043E\u0432 \u043D\u0435 \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u044E\u0442\u0441\u044F.',
+        en: 'No object or face detection. Layers and frames are matched by aspect ratio; the complete layer is then centered and scaled to fully cover the frame. Object margin settings are not used.'
+    };
+}
+
+function finishSubjectGeometry(subject, layerBounds) {
+    try {
+        subject.layer = layerBounds;
+        subject.layer.center = {
+            y: Number(layerBounds.top) + Number(layerBounds.height) / 2,
+            x: Number(layerBounds.left) + Number(layerBounds.width) / 2
+        };
+
+        // Both Python and autoCutout operate on a rasterized local view. Clamp
+        // tiny detection overshoots to the actual restored layer bounds.
+        if (subject.top < layerBounds.top) subject.top = layerBounds.top;
+        if (subject.left < layerBounds.left) subject.left = layerBounds.left;
+        if (subject.bottom > layerBounds.bottom) subject.bottom = layerBounds.bottom;
+        if (subject.right > layerBounds.right) subject.right = layerBounds.right;
+        subject.width = subject.right - subject.left;
+        subject.height = subject.bottom - subject.top;
+        if (subject.width <= 1 || subject.height <= 1) return null;
+        subject.center = { y: subject.top + subject.height / 2, x: subject.left + subject.width / 2 };
+        subject.vertical = subject.height > subject.width;
+        subject.ratio = subject.width / subject.height;
+
+        subject.offset = {
+            top: subject.top - layerBounds.top,
+            left: subject.left - layerBounds.left,
+            bottom: layerBounds.bottom - subject.bottom,
+            right: layerBounds.right - subject.right,
+            width: layerBounds.width,
+            height: layerBounds.height
+        };
+        return subject;
+    } catch (e) {
+        return null;
+    }
+}
+
+function exportLayerPreview(sourceDoc, id, index, tempFiles) {
+    var smartDoc = null,
+        file = null,
+        oldDialogs = app.displayDialogs,
+        stage = 'select source layer';
+    try {
+        app.displayDialogs = DialogModes.NO;
+        app.activeDocument = sourceDoc;
+        lr.selectLayer(id);
+
+        var stamp = (new Date()).getTime(),
+            token = Math.floor(Math.random() * 1000000);
+
+        // Work on the ORIGINAL layer. Do not Undo here: all preview-related
+        // conversions are restored together after the complete preview pass.
+        stage = 'convert source layer to Smart Object';
+        convertActiveLayerToSmartObject();
+
+        stage = 'open Smart Object contents';
+        openActiveSmartObjectContents();
+        smartDoc = app.activeDocument;
+        if (!smartDoc || smartDoc == sourceDoc) throw new Error('Smart Object contents did not open.');
+
+        stage = 'flatten Smart Object contents';
+        if (smartDoc.layers.length > 1) smartDoc.flatten();
+
+        stage = 'convert preview to RGB/8-bit';
+        try {
+            if (smartDoc.mode != DocumentMode.RGB) smartDoc.changeMode(ChangeMode.RGB);
+        } catch (modeError) { }
+        try { smartDoc.bitsPerChannel = BitsPerChannelType.EIGHT; } catch (bitsError) { }
+
+        stage = 'resize preview';
+        var tw = Number(smartDoc.width.as('px')),
+            th = Number(smartDoc.height.as('px')),
+            maxSide = Math.max(tw, th);
+        if (!(tw > 0) || !(th > 0)) throw new Error('Smart Object has invalid dimensions.');
+        if (maxSide > PREVIEW_MAX) {
+            var k = PREVIEW_MAX / maxSide;
+            smartDoc.resizeImage(UnitValue(Math.max(1, Math.round(tw * k)), 'px'),
+                UnitValue(Math.max(1, Math.round(th * k)), 'px'), null, ResampleMethod.BILINEAR);
+        }
+
+        stage = 'save JPEG preview';
+        file = new File(Folder.temp.fsName + '/align_fit_' + stamp + '_' + id + '_' + index + '_' + token + '.jpg');
+        var jpg = new JPEGSaveOptions();
+        jpg.quality = 6;
+        jpg.embedColorProfile = false;
+        jpg.formatOptions = FormatOptions.STANDARDBASELINE;
+        smartDoc.saveAs(file, jpg, true, Extension.LOWERCASE);
+        if (!file.exists) throw new Error('JPEG file was not created.');
+
+        var out = {
+            id: id,
+            path: file.fsName,
+            width: Math.round(Number(smartDoc.width.as('px'))),
+            height: Math.round(Number(smartDoc.height.as('px')))
+        };
+        tempFiles.push(file);
+
+        stage = 'close Smart Object contents';
+        smartDoc.close(SaveOptions.DONOTSAVECHANGES);
+        smartDoc = null;
+        app.activeDocument = sourceDoc;
+        return out;
+    } catch (e) {
+        try {
+            if (smartDoc) {
+                app.activeDocument = smartDoc;
+                smartDoc.close(SaveOptions.DONOTSAVECHANGES);
+                smartDoc = null;
+            }
+        } catch (ignore0) { }
+        try { app.activeDocument = sourceDoc; } catch (ignore1) { }
+        try { if (file && file.exists) file.remove(); } catch (ignore2) { }
+        throw new Error('Cannot create JPEG preview for layer ' + id + ' [' + stage + ']: ' + e.message);
+    } finally {
+        try { app.activeDocument = sourceDoc; } catch (ignore3) { }
+        app.displayDialogs = oldDialogs;
+    }
+}
+
+function convertActiveLayerToSmartObject() {
+    executeAction(stringIDToTypeID('newPlacedLayer'), undefined, DialogModes.NO);
+}
+
+function openActiveSmartObjectContents() {
+    executeAction(stringIDToTypeID('placedLayerEditContents'), undefined, DialogModes.NO);
+}
+
+
+function reselectLayers(ids) {
+    if (!ids || !ids.length) return;
+    // First selection replaces the current layer selection; the rest are added.
+    lr.selectLayer(ids[0], false);
+    for (var i = 1; i < ids.length; i++) lr.selectLayer(ids[i], true);
+}
+
+function cleanupTempFiles(files) {
+    for (var i = 0; i < files.length; i++) {
+        try { if (files[i] && files[i].exists) files[i].remove(); } catch (e) { }
+    }
+}
+
+function cleanupStaleTempFiles() {
+    try {
+        var files = Folder.temp.getFiles('align_fit_*.jpg'),
+            cutoff = (new Date()).getTime() - 60 * 60 * 1000;
+        for (var i = 0; i < files.length; i++) {
+            try {
+                if (!(files[i] instanceof File) || !files[i].exists) continue;
+                var modified = files[i].modified;
+                // Never delete a preview that may belong to another active Photoshop
+                // instance. Only clean files that are clearly stale.
+                if (modified && modified.getTime() < cutoff) files[i].remove();
+            } catch (e) { }
+        }
+    } catch (ignore) { }
+}
+
+
+function findFrameById(frames, id) {
+    for (var i = 0; i < frames.length; i++) {
+        if (String(frames[i].id) == String(id)) return frames[i];
+    }
+    return null;
+}
+
+
+function alignLayerBounds(subject, frame) {
+    // Dedicated Cover mode: center the complete layer in the frame and scale it
+    // just enough to cover the frame in both dimensions. Object margins/offsets
+    // are intentionally ignored in this mode.
+    var layer = doc.descToObject(lr.getProperty('boundsNoEffects', false, subject.id));
+    if (!layer || !(Number(layer.width) > 0) || !(Number(layer.height) > 0)) {
+        throw new Error(L(str.errLayerBounds));
+    }
+    layer.center = {
+        x: Number(layer.left) + Number(layer.width) / 2,
+        y: Number(layer.top) + Number(layer.height) / 2
+    };
+
+    var bleed = FINAL_BLEED_PX > 0 ? FINAL_BLEED_PX : 0,
+        requiredW = Number(frame.width) + bleed * 2,
+        requiredH = Number(frame.height) + bleed * 2,
+        scaleW = requiredW / Number(layer.width),
+        scaleH = requiredH / Number(layer.height),
+        scale = Math.max(scaleW, scaleH) * 100,
+        dX = Number(frame.center.x) - layer.center.x,
+        dY = Number(frame.center.y) - layer.center.y;
+
+    lr.transform(dX, dY, scale, layer.center.x, layer.center.y);
+}
+
+function alignLayer(subject, frame) {
+    var dH = frame.center.x - subject.center.x,
+        dV = frame.center.y - subject.center.y,
+        border = subject.offset.right < subject.offset.left ? subject.offset.right : subject.offset.left,
+        scale = frame.width / (border * 2 + subject.width) * 100;
+    lr.transform(dH, dV, scale, subject.center.x, subject.center.y, subject, true)
+    if (subject.height > frame.height) {
+        var ratioTop = frame.height * ((frame.vertical ? cfg.vTop : cfg.hTop) / 100) * 0.5;
+        ratioTop = ratioTop < subject.offset.top ? ratioTop : subject.offset.top
+        lr.move(0, frame.top - subject.top + ratioTop, subject, true)
+    } else {
+        var ratioTop = frame.height * ((frame.vertical ? cfg.vTop : cfg.hTop) / 100),
+            ratioBottom = frame.height * ((frame.vertical ? cfg.vBottom : cfg.hBottom) / 100),
+            ratioWidth = frame.width * ((frame.vertical ? cfg.vSide : cfg.hSide) / 100)
+        ratioTop = ratioTop < subject.offset.top ? ratioTop : subject.offset.top
+        ratioBottom = ratioBottom > subject.offset.bottom ? subject.offset.bottom : ratioBottom
+        ratioWidth = ratioWidth > subject.offset.right ? subject.offset.right : ratioWidth
+        ratioWidth = ratioWidth > subject.offset.left ? subject.offset.left : ratioWidth
+        if (subject.height < frame.height) {
+            lr.transform(0, 0, (frame.bottom - subject.top) / ((subject.bottom + subject.offset.bottom) - subject.top) * 100, subject.center.x, subject.top, subject, true)
+            lr.transform(0, 0, (subject.bottom - frame.top) / (subject.bottom - subject.top + subject.offset.top) * 100, subject.center.x, subject.bottom, subject, true)
+            if (subject.height + ratioTop + ratioBottom < frame.height || subject.width + ratioWidth * 2 < frame.width) {
+                var scale = []
+                scale.push((frame.bottom - subject.center.y) / (subject.bottom + ratioBottom - subject.center.y) * 100)
+                scale.push((subject.center.y - frame.top) / (subject.center.y - (subject.top - ratioTop)) * 100)
+                scale.push((subject.center.x - frame.left) / (subject.center.x - (subject.left - ratioWidth)) * 100)
+                scale.push((frame.right - subject.center.x) / (subject.right + ratioWidth - subject.center.x) * 100)
+                scale.sort(function (a, b) { return a > b ? 1 : -1 })
+                if (scale[0] > 100) lr.transform(0, 0, scale[0], subject.center.x, subject.center.y, subject, true)
+            }
+        }
+        else {
+            lr.move(0, frame.top - subject.top + ratioTop, subject, true)
+            if (subject.bottom < frame.bottom) {
+                lr.transform(0, 0, (frame.bottom - subject.top) / (subject.bottom + ratioBottom - subject.top) * 100, frame.center.x, subject.top, subject, true)
+            }
+        }
+    }
+    if (!lr.getProperty('hasUserMask', false, frame.id) || !(lr.hasProperty('userMaskEnabled', frame.id) ? lr.getProperty('userMaskEnabled', false, frame.id) : false)) {
+        var visibleFrame = doc.descToObject(lr.getProperty('boundsNoEffects', false, frame.id)),
+            scale = [];
+        with (subject) {
+            if (visibleFrame.bottom > bottom + offset.bottom || visibleFrame.top < top - offset.top || visibleFrame.right > right + offset.right || visibleFrame.left < left - offset.left) {
+                scale.push((visibleFrame.bottom - frame.center.y) / (bottom + offset.bottom - frame.center.y) * 100)
+                scale.push((frame.center.y - visibleFrame.top) / (frame.center.y - (top - offset.top)) * 100)
+                scale.push((visibleFrame.right - frame.center.x) / (right + offset.right - frame.center.x) * 100)
+                scale.push((frame.center.x - visibleFrame.left) / (frame.center.x - (left - offset.left)) * 100)
+                if (scale.length) {
+                    scale.sort(function (a, b) { return a < b ? 1 : -1 })
+                    lr.transform(0, 0, scale[0], frame.center.x, frame.center.y, subject, true)
+                }
+            }
+        }
+    }
+    with (subject) {
+        top -= offset.top
+        left -= offset.left
+        right += offset.right
+        bottom += offset.bottom
+        center = { y: top + (bottom - top) / 2, x: left + (right - left) / 2 }
+        var targetW = right - left,
+            targetH = bottom - top,
+            bleed = FINAL_BLEED_PX,
+            bleedFactor = 1;
+        if (targetW > 0 && targetH > 0 && bleed > 0) {
+            bleedFactor = Math.max((targetW + bleed * 2) / targetW, (targetH + bleed * 2) / targetH);
+        }
+        lr.transform(center.x - layer.center.x, center.y - layer.center.y, (targetW / layer.width) * 100 * bleedFactor, layer.center.x, layer.center.y)
+    }
+}
+function AM(target, order) {
+    var s2t = stringIDToTypeID,
+        t2s = typeIDToStringID;
+    target = s2t(target)
+    this.getProperty = function (property, descMode, id, idxMode) {
+        property = s2t(property);
+        (r = new ActionReference()).putProperty(s2t('property'), property);
+        id != undefined ? (idxMode ? r.putIndex(target, id) : r.putIdentifier(target, id)) :
+            r.putEnumerated(target, s2t('ordinal'), order ? s2t(order) : s2t('targetEnum'));
+        return descMode ? executeActionGet(r) : getDescValue(executeActionGet(r), property)
+    }
+    this.hasProperty = function (property, id, idxMode) {
+        property = s2t(property);
+        (r = new ActionReference()).putProperty(s2t('property'), property);
+        id ? (idxMode ? r.putIndex(target, id) : r.putIdentifier(target, id))
+            : r.putEnumerated(target, s2t('ordinal'), order ? s2t(order) : s2t('targetEnum'));
+        return executeActionGet(r).hasKey(property)
+    }
+    this.descToObject = function (d) {
+        var o = {}
+        for (var i = 0; i < d.count; i++) {
+            var k = d.getKey(i)
+            o[t2s(k)] = getDescValue(d, k)
+        }
+        return o
+    }
+    this.selectLayer = function (id, add) {
+        add = (add == undefined) ? add = false : add;
+        (r = new ActionReference()).putIdentifier(s2t('layer'), id);
+        (d = new ActionDescriptor()).putReference(s2t('null'), r);
+        if (add) { d.putEnumerated(s2t('selectionModifier'), s2t('selectionModifierType'), s2t('addToSelection')) }
+        d.putBoolean(s2t('makeVisible'), false)
+        executeAction(s2t('select'), d, DialogModes.NO)
+    }
+    this.moveLayer = function (from, to) {
+        (r = new ActionReference()).putIndex(s2t('layer'), from);
+        (d = new ActionDescriptor()).putReference(s2t('null'), r);
+        (r1 = new ActionReference()).putIndex(s2t('layer'), to);
+        d.putReference(s2t('to'), r1);
+        executeAction(s2t('move'), d, DialogModes.NO);
+    }
+    this.setQuickMask = function (mode) {
+        (r = new ActionReference()).putProperty(s2t('property'), s2t('quickMask'));
+        r.putEnumerated(s2t('document'), s2t('ordinal'), s2t('targetEnum'));
+        (d = new ActionDescriptor()).putReference(s2t('null'), r);
+        executeAction(mode ? s2t('set') : s2t('clearEvent'), d, DialogModes.NO);
+    }
+    this.levels = function (paramsArray) {
+        var left = paramsArray[0],
+            gamma = paramsArray[1],
+            right = paramsArray[2];
+        (d = new ActionDescriptor()).putEnumerated(s2t('presetKind'), s2t('presetKindType'), s2t('presetKindCustom'));
+        (r = new ActionReference()).putEnumerated(s2t('channel'), s2t('ordinal'), s2t('targetEnum'));
+        (d1 = new ActionDescriptor()).putReference(s2t('channel'), r);
+        (l = new ActionList()).putInteger(left);
+        l.putInteger(right);
+        d1.putList(s2t('input'), l);
+        d1.putDouble(s2t('gamma'), gamma);
+        (l1 = new ActionList()).putObject(s2t('levelsAdjustment'), d1);
+        d.putList(s2t('adjustment'), l1);
+        executeAction(s2t('levels'), d, DialogModes.NO)
+    }
+    this.deselect = function () {
+        (r = new ActionReference()).putProperty(s2t('channel'), s2t('selection'));
+        (d = new ActionDescriptor()).putReference(s2t('null'), r);
+        d.putEnumerated(s2t('to'), s2t('ordinal'), s2t('none'));
+        executeAction(s2t('set'), d, DialogModes.NO);
+    }
+    this.autoCutout = function (sampleAllLayers) {
+        sampleAllLayers = sampleAllLayers == undefined ? false : true;
+        (d = new ActionDescriptor()).putBoolean(s2t('sampleAllLayers'), sampleAllLayers);
+        executeAction(s2t('autoCutout'), d, DialogModes.NO);
+    }
+    this.getSelectionMode = function () {
+        (r = new ActionReference()).putProperty(s2t('property'), p = s2t('imageProcessingPrefs'));
+        r.putEnumerated(s2t('application'), s2t('ordinal'), s2t('targetEnum'));
+        return t2s(executeActionGet(r).getObjectValue(p).getEnumerationValue(s2t('imageProcessingSelectSubjectPrefs')));
+    }
+    this.setSelectionMode = function (state) {
+        (r = new ActionReference()).putProperty(s2t('property'), s2t('imageProcessingPrefs'));
+        r.putEnumerated(s2t('application'), s2t('ordinal'), s2t('targetEnum'));
+        (d = new ActionDescriptor()).putReference(s2t('null'), r);
+        (d1 = new ActionDescriptor()).putEnumerated(s2t('imageProcessingSelectSubjectPrefs'), s2t('imageProcessingSelectSubjectPrefs'), s2t(state));
+        d.putObject(s2t('to'), s2t('imageProcessingPrefs'), d1);
+        executeAction(s2t('set'), d, DialogModes.NO);
+    }
+    this.groupCurrentLayer = function () {
+        (r = new ActionReference()).putEnumerated(s2t('layer'), s2t('ordinal'), s2t('targetEnum'));
+        (d = new ActionDescriptor()).putReference(s2t('null'), r);
+        executeAction(s2t('groupEvent'), d, DialogModes.NO);
+    }
+    this.transform = function (dX, dY, scale, x, y, subject, fake) {
+        if (!fake) {
+            (r = new ActionReference()).putEnumerated(s2t('layer'), s2t('ordinal'), s2t('targetEnum'));
+            (d = new ActionDescriptor()).putReference(s2t('null'), r);
+            d.putEnumerated(s2t('freeTransformCenterState'), s2t('quadCenterState'), s2t('QCSIndependent'));
+            ((d1 = new ActionDescriptor())).putUnitDouble(s2t('horizontal'), s2t('pixelsUnit'), x);
+            d1.putUnitDouble(s2t('vertical'), s2t('pixelsUnit'), y);
+            d.putObject(s2t('position'), s2t('paint'), d1);
+            (d2 = new ActionDescriptor()).putUnitDouble(s2t('horizontal'), s2t('pixelsUnit'), dX);
+            d2.putUnitDouble(s2t('vertical'), s2t('pixelsUnit'), dY);
+            d.putObject(s2t('offset'), s2t('offset'), d2);
+            d.putUnitDouble(s2t('width'), s2t('percentUnit'), scale);
+            d.putUnitDouble(s2t('height'), s2t('percentUnit'), scale);
+            d.putEnumerated(s2t('interfaceIconFrameDimmed'), s2t('interpolationType'), s2t('bicubic'));
+            if (!isFiniteNumber(dX) || !isFiniteNumber(dY) || !isFiniteNumber(scale) || !isFiniteNumber(x) || !isFiniteNumber(y) || scale <= 0) {
+                throw new Error('Invalid Transform geometry: offset=(' + dX + ', ' + dY + '), scale=' + scale + ', center=(' + x + ', ' + y + ')');
+            }
+            try {
+                executeAction(s2t('transform'), d, DialogModes.NO);
+            } catch (transformError) {
+                var info = [];
+                try { info.push('layerID=' + lr.getProperty('layerID')); } catch (e0) { }
+                try { info.push('name=' + lr.getProperty('name')); } catch (e1) { }
+                try { info.push('group=' + lr.getProperty('group')); } catch (e2) { }
+                try { info.push('visible=' + lr.getProperty('visible')); } catch (e21) { }
+                try {
+                    var tb = doc.descToObject(lr.getProperty('boundsNoEffects'));
+                    info.push('bounds=[' + tb.left + ',' + tb.top + ',' + tb.right + ',' + tb.bottom + ']');
+                } catch (e3) { }
+                info.push('offset=(' + dX + ',' + dY + ')');
+                info.push('scale=' + scale);
+                info.push('center=(' + x + ',' + y + ')');
+                throw new Error(transformError.message + '\nTransform context: ' + info.join('; '));
+            }
+        }
+        if (subject) {
+            with (subject) {
+                var dV = (height * scale / 100 - (bottom - top)),
+                    dH = (width * scale / 100 - (right - left));
+                top = top - (dV * (y - top) / height) + dY
+                bottom = bottom + (dV * (bottom - y) / height) + dY
+                left = left - (dH * (x - left) / width) + dX
+                right = right + (dH * (right - x) / width) + dX
+                center.x = left + (right - left) / 2
+                center.y = top + (bottom - top) / 2
+                height = height * scale / 100
+                width = width * scale / 100
+            }
+            with (subject.offset) {
+                top = top * scale / 100
+                left = left * scale / 100
+                bottom = bottom * scale / 100
+                right = right * scale / 100
+                height = height * scale / 100
+                width = width * scale / 100
+            }
+        }
+    }
+    this.move = function (dX, dY, subject, fake) {
+        if (!fake) {
+            (r = new ActionReference()).putEnumerated(s2t('layer'), s2t('ordinal'), s2t('targetEnum'));
+            (d = new ActionDescriptor()).putReference(s2t('null'), r);
+            (d1 = new ActionDescriptor()).putUnitDouble(s2t('horizontal'), s2t('pixelsUnit'), dX);
+            d1.putUnitDouble(s2t('vertical'), s2t('pixelsUnit'), dY);
+            d.putObject(s2t('to'), s2t('offset'), d1);
+            executeAction(s2t('move'), d, DialogModes.NO);
+        }
+        with (subject) {
+            center.x += dX
+            center.y += dY
+            top += dY
+            bottom += dY
+            left += dX
+            right += dX
+        }
+    }
+    this.makeSelection = function (id, mask) {
+        (r = new ActionReference()).putProperty(s2t('channel'), s2t('selection'));
+        (d = new ActionDescriptor()).putReference(s2t('null'), r);
+        r1 = new ActionReference();
+        if (mask) {
+            r1.putEnumerated(s2t("path"), s2t("path"), s2t("vectorMask"));
+        } else {
+            r1.putEnumerated(s2t('channel'), s2t('channel'), s2t('transparencyEnum'));
+        }
+        r1.putIdentifier(s2t('layer'), id);
+        d.putReference(s2t('to'), r1);
+        executeAction(s2t('set'), d, DialogModes.NO);
+    }
+    this.makeSelectionFromPath = function () {
+        (r = new ActionReference()).putProperty(s2t('channel'), s2t('selection'));
+        (d = new ActionDescriptor()).putReference(s2t('null'), r);
+        (r1 = new ActionReference()).putProperty(s2t('path'), s2t('workPath'));
+        d.putReference(s2t('to'), r1);
+        d.putBoolean(s2t('vectorMaskParams'), true);
+        executeAction(s2t('set'), d, DialogModes.NO);
+    }
+    this.deleteCurrentPath = function () {
+        (r = new ActionReference()).putProperty(s2t('path'), s2t('workPath'));
+        (d = new ActionDescriptor()).putReference(s2t('null'), r);
+        executeAction(s2t('delete'), d, DialogModes.NO);
+    }
+    this.createPath = function (tolerance) {
+        tolerance = tolerance ? tolerance : 10;
+        (r = new ActionReference()).putClass(s2t('path'));
+        (d = new ActionDescriptor()).putReference(s2t('null'), r);
+        (r1 = new ActionReference()).putProperty(s2t('selectionClass'), s2t('selection'));
+        d.putReference(s2t('from'), r1);
+        d.putUnitDouble(s2t('tolerance'), s2t('pixelsUnit'), tolerance);
+        executeAction(s2t('make'), d, DialogModes.NO);
+    }
+    this.setLayerVisiblity = function (id, makeVisible) {
+        var mode = makeVisible ? "show" : "hide";
+        (r = new ActionReference()).putIdentifier(s2t('layer'), id);
+        (d = new ActionDescriptor()).putReference(s2t('target'), r);
+        executeAction(s2t(mode), d, DialogModes.NO);
+    }
+    function getDescValue(d, p) {
+        switch (d.getType(p)) {
+            case DescValueType.OBJECTTYPE: return (d.getObjectValue(p));
+            case DescValueType.LISTTYPE: return d.getList(p);
+            case DescValueType.REFERENCETYPE: return d.getReference(p);
+            case DescValueType.BOOLEANTYPE: return d.getBoolean(p);
+            case DescValueType.STRINGTYPE: return d.getString(p);
+            case DescValueType.INTEGERTYPE: return d.getInteger(p);
+            case DescValueType.LARGEINTEGERTYPE: return d.getLargeInteger(p);
+            case DescValueType.DOUBLETYPE: return d.getDouble(p);
+            case DescValueType.ALIASTYPE: return d.getPath(p);
+            case DescValueType.CLASSTYPE: return d.getClass(p);
+            case DescValueType.UNITDOUBLE: return (d.getUnitDoubleValue(p));
+            case DescValueType.ENUMERATEDTYPE: return [t2s(d.getEnumerationType(p)), t2s(d.getEnumerationValue(p))];
+            default: break;
+        };
+    }
+}
+function isFiniteNumber(v) {
+    return typeof v == 'number' && !isNaN(v) && isFinite(v);
+}
+
+function findApiFile(scriptPath) {
+    for (var i = 0; i < API_FILES.length; i++) {
+        var apiFile = new File(scriptPath + '/' + API_FILES[i]);
+        if (apiFile.exists) return apiFile;
+    }
+    return null;
+}
+
+function getRuntimeInfo() {
+    var local = $.getenv('LOCALAPPDATA');
+    if (!local) {
+        try { local = Folder.userData.parent.fsName + '/Local'; } catch (e) { local = ''; }
+    }
+    var root = new Folder(local + '/' + RUNTIME_NAME);
+    return {
+        root: root,
+        pythonw: new File(root.fsName + '/venv/Scripts/pythonw.exe'),
+        launcher: new File(root.fsName + '/launcher.vbs'),
+        humanModel: new File(root.fsName + '/venv/models/human.onnx'),
+        faceModel: new File(root.fsName + '/venv/models/face.onnx')
+    };
+}
+
+function analysisApi(apiHost, portSend, portListen, apiFile, runtime) {
+    var requestSeq = 0;
+
+    this.init = function () {
+        var result = sendMessage({ type: 'handshake', message: '' }, PING_DELAY, true, true);
+        if (isSuccessHandshake(result)) return true;
+
+        // Any reply without request_id is from the pre-0.4.1 protocol. Stop that
+        // server even if the delayed packet was an old analyze/match response.
+        if (result && result.request_id == undefined) {
+            sendMessage({ type: 'exit', message: '' }, 250, true, false);
+            $.sleep(250);
+            result = null;
+        } else if (result && result.type == 'answer' && result.message && result.message.status == 'success') {
+            sendMessage({ type: 'exit', message: '' }, 250, true, false);
+            $.sleep(250);
+            result = null;
+        }
+
+        if (!apiFile || !apiFile.exists) throw new Error('Python module not found: ' + API_FILES.join(', '));
+        if (!runtime || !runtime.pythonw.exists || !runtime.launcher.exists) {
+            throw new Error('AlignFit runtime not found. Run install_runtime.bat once.');
+        }
+
+        try {
+            $.setenv('ALIGN_FIT_SERVER', apiFile.fsName);
+            runtime.launcher.execute();
+        } catch (e) {
+            throw new Error('Cannot start AlignFit runtime: ' + e.message);
+        }
+
+        result = waitForHandshake(INIT_DELAY);
+        if (isSuccessHandshake(result)) return true;
+        if (result && result.type == 'error') {
+            sendMessage({ type: 'exit', message: '' }, 250, true, false);
+            throw new Error(result.message);
+        }
+        throw new Error('Cannot connect to align-fit-api');
+    };
+
+    this.sendPayload = function (type, payload, delay) {
+        var result = sendMessage({ type: type, message: payload }, delay, true, true);
+        if (result) {
+            if (result.type == 'answer') return result.message;
+            if (result.type == 'error') throw new Error(result.message);
+        }
+        throw new Error('No response from align-fit-api');
+    };
+
+    function isSuccessHandshake(result) {
+        return result && result.type == 'answer' && result.message && result.message.status == 'success' && result.message.version == EXPECTED_SERVER_VERSION;
+    }
+
+    function waitForHandshake(delay) {
+        var t0 = (new Date()).getTime(),
+            lastResult = null,
+            now = t0;
+        while ((now = (new Date()).getTime()) - t0 < delay) {
+            var remaining = Math.max(500, delay - (now - t0));
+            // If the server is not listening, sendMessage returns immediately. Once
+            // it accepts the connection, allow model initialization to finish.
+            lastResult = sendMessage({ type: 'handshake', message: '' }, remaining, true, true);
+            if (lastResult) break;
+            $.sleep(100);
+        }
+        return lastResult;
+    }
+
+    function sendMessage(o, delay, sendData, getData) {
+        delay = delay ? delay : INIT_DELAY;
+        var requestId = String((new Date()).getTime()) + '-' + (++requestSeq),
+            listener = null,
+            t1 = 0,
+            t2 = 0;
+        o.request_id = requestId;
+
+        if (getData) {
+            listener = new Socket();
+            if (!listener.listen(portListen, 'UTF-8')) return null;
+            t1 = (new Date()).getTime();
+        }
+
+        if (sendData) {
+            var sender = new Socket();
+            if (sender.open(apiHost + ':' + portSend, 'UTF-8')) {
+                sender.writeln(objectToJSON(o));
+                sender.close();
+            } else {
+                if (listener) listener.close();
+                return null;
+            }
+        }
+
+        if (!getData) return true;
+        for (;;) {
+            t2 = (new Date()).getTime();
+            if (t2 - t1 > delay) {
+                if (listener) listener.close();
+                return null;
+            }
+            var answer = listener.poll();
+            if (answer != null) {
+                var a = null;
+                try { a = eval('(' + answer.readln() + ')'); } catch (e) { a = null; }
+                try { answer.close(); } catch (e2) { }
+
+                // Ignore delayed replies from an older request. A legacy handshake
+                // without request_id is accepted only to detect/stop an old server.
+                var legacyHandshake = o.type == 'handshake' && a && a.request_id == undefined;
+                if (a && !legacyHandshake && String(a.request_id) != requestId) continue;
+                if (!a) continue;
+
+                if (listener) listener.close();
+                return a;
+            }
+            $.sleep(1);
+        }
+    }
+
+    function objectToJSON(obj) {
+        if (obj === null) return 'null';
+        var t = typeof obj;
+        if (t == 'string') return '"' + escapeJSONString(obj) + '"';
+        if (t == 'number') return isFinite(obj) ? String(obj) : 'null';
+        if (t == 'boolean') return obj ? 'true' : 'false';
+        if (obj instanceof Array) {
+            var arr = [];
+            for (var i = 0; i < obj.length; i++) arr.push(objectToJSON(obj[i]));
+            return '[' + arr.join(',') + ']';
+        }
+        var result = [];
+        for (var key in obj) {
+            if (obj.hasOwnProperty(key)) result.push('"' + escapeJSONString(key) + '":' + objectToJSON(obj[key]));
+        }
+        return '{' + result.join(',') + '}';
+    }
+
+    function escapeJSONString(value) {
+        return String(value)
+            .replace(/\\/g, '\\\\')
+            .replace(/"/g, '\\"')
+            .replace(/\r/g, '\\r')
+            .replace(/\n/g, '\\n')
+            .replace(/\t/g, '\\t');
+    }
+}
