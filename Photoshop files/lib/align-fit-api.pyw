@@ -10,7 +10,7 @@ API_HOST = "127.0.0.1"
 API_PORT_SEND = 6321       # Python -> JSX
 API_PORT_LISTEN = 6320     # JSX -> Python
 TIMEOUT = 15 * 60
-SERVER_VERSION = "0.4.1"
+SERVER_VERSION = "0.4.2"
 
 # Models are installed with the private runtime, outside the Photoshop folder.
 # sys.prefix points to the active venv when the server is started by launcher.vbs.
@@ -343,16 +343,22 @@ def hungarian(cost):
     return assignment
 
 
-def match_group(subjects, frames):
+def match_group(subjects, frames, use_face_count=True):
     if not subjects or not frames:
         return []
 
-    # Face count controls the desired size rank. Bbox area only resolves equal/failed counts.
-    s_rank = average_ranks(
-        subjects,
-        lambda x: (int(x.get("faces", 0)), float(x.get("bbox_area", 0.0))),
-    )
-    f_rank = average_ranks(frames, lambda x: float(x.get("area", 0.0)))
+    # Aspect ratio is always the primary criterion. The optional face-count
+    # criterion ranks group photos against frame area; bbox area only resolves
+    # ties between photos with the same detected face count.
+    if use_face_count:
+        s_rank = average_ranks(
+            subjects,
+            lambda x: (int(x.get("faces", 0)), float(x.get("bbox_area", 0.0))),
+        )
+        f_rank = average_ranks(frames, lambda x: float(x.get("area", 0.0)))
+    else:
+        s_rank = {}
+        f_rank = {}
 
     matrix = []
     for subject in subjects:
@@ -363,7 +369,9 @@ def match_group(subjects, frames):
             fr = max(1e-6, float(frame.get("ratio", 1.0)))
             f_vertical = fr < 1.0
             ratio_cost = abs(math.log(sr / fr)) * RATIO_WEIGHT
-            size_cost = abs(s_rank[subject["id"]] - f_rank[frame["id"]]) * SIZE_WEIGHT
+            size_cost = 0.0
+            if use_face_count:
+                size_cost = abs(s_rank[subject["id"]] - f_rank[frame["id"]]) * SIZE_WEIGHT
             orientation_cost = ORIENTATION_PENALTY if s_vertical != f_vertical else 0.0
             row.append(ratio_cost + size_cost + orientation_cost)
         matrix.append(row)
@@ -385,6 +393,7 @@ def match_group(subjects, frames):
 def match_items(payload):
     subjects = payload.get("subjects") or []
     frames = payload.get("frames") or []
+    use_face_count = bool(payload.get("use_face_count", True))
     colors = {}
     for subject in subjects:
         colors.setdefault(str(subject.get("color", "none")), {"subjects": [], "frames": []})[
@@ -397,7 +406,7 @@ def match_items(payload):
 
     result = []
     for group in colors.values():
-        result.extend(match_group(group["subjects"], group["frames"]))
+        result.extend(match_group(group["subjects"], group["frames"], use_face_count))
     return result
 
 

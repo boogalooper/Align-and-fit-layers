@@ -17,14 +17,14 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = 0.516,
+var SCRIPT_VERSION = 0.517,
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
     API_PORT_LISTEN = 6321,
     API_FILES = ['lib/align-fit-api.pyw', 'align-fit-api.pyw'],
     RUNTIME_NAME = 'AlignFitRuntime',
-    EXPECTED_SERVER_VERSION = '0.4.1',
+    EXPECTED_SERVER_VERSION = '0.4.2',
     PREVIEW_MAX = 1280,
     FINAL_BLEED_PX = 2,
     INIT_DELAY = 15000,
@@ -719,7 +719,11 @@ function matchFramesStage() {
         for (var j = 0; j < runCtx.frames.length; j++) {
             matchFrames.push({ id: runCtx.frames[j].id, color: runCtx.frames[j].color, ratio: runCtx.frames[j].ratio, area: runCtx.frames[j].area });
         }
-        var matched = afApi.sendPayload('match', { subjects: matchSubjects, frames: matchFrames }, MATCH_DELAY);
+        var matched = afApi.sendPayload('match', {
+            subjects: matchSubjects,
+            frames: matchFrames,
+            use_face_count: !!cfg.useFaceCount
+        }, MATCH_DELAY);
         if (!matched || !matched.assignments) throw new Error('Python returned an invalid frame-matching response.');
         runCtx.assignments = {};
         for (var mi = 0; mi < matched.assignments.length; mi++) {
@@ -777,11 +781,21 @@ function alignSubjectChunk(i) {
             frame = findFrameById(runCtx.frames, runCtx.assignments[String(subject.id)]);
         }
         // In the user-approved shortage case, an unmatched layer deliberately
-        // stays exactly where it was.
-        if (frame) moveAndAlignSubject(subject, frame);
+        // stays exactly where it was. Fallback is alignment-only: the common
+        // bottom layer is a geometric reference, not a clipping base.
+        if (frame) {
+            if (runCtx.selectedFallback) alignSubjectInPlace(subject, frame);
+            else moveAndAlignSubject(subject, frame);
+        }
     }
     app.changeProgressText(text);
     $.sleep(0);
+}
+
+function alignSubjectInPlace(subject, frame) {
+    lr.selectLayer(subject.id);
+    if (cfg.engine == 'layer') alignLayerBounds(subject, frame);
+    else alignLayer(subject, frame);
 }
 
 function moveAndAlignSubject(subject, frame) {
@@ -984,6 +998,7 @@ function dialog(actionMode) {
     var dlg = new Window("dialog{orientation:'column',alignChildren:['fill','top'],spacing:10,margins:16}"),
         pnEngine = dlg.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:8,margins:10}"),
         dlEngine = pnEngine.add('dropdownlist'),
+        chFaceCount = pnEngine.add('checkbox'),
         stDesc = pnEngine.add("statictext{properties:{multiline:true},preferredSize:[390,72]}"),
         pnMargins = dlg.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:6,margins:[10,18,10,10]}"),
         stVertical = pnMargins.add('statictext'),
@@ -1000,6 +1015,8 @@ function dialog(actionMode) {
 
     dlg.text = L(str.title) + ' ' + SCRIPT_VERSION;
     pnEngine.text = L(str.enginePanel);
+    chFaceCount.text = L(str.useFaceCount);
+    chFaceCount.value = !!cfg.useFaceCount;
     pnMargins.text = L(str.offsetPanel);
     stVertical.text = L(str.verticalFrame);
     stHorizontal.text = L(str.horizontalFrame);
@@ -1017,9 +1034,14 @@ function dialog(actionMode) {
         dlEngine.selection = 0;
     }
     function updateEngineUI() {
-        var key = dlEngine.selection ? dlEngine.selection.engineKey : cfg.engine;
+        var key = dlEngine.selection ? dlEngine.selection.engineKey : cfg.engine,
+            pythonMode = key == 'python';
+        chFaceCount.visible = pythonMode;
+        chFaceCount.enabled = pythonMode;
         stDesc.text = engineDescription(key);
         pnMargins.enabled = key != 'layer';
+        pnEngine.layout.layout(true);
+        dlg.layout.layout(true);
     }
 
     selectEngine(cfg.engine);
@@ -1029,6 +1051,9 @@ function dialog(actionMode) {
         if (!this.selection) return;
         cfg.engine = this.selection.engineKey;
         updateEngineUI();
+    };
+    chFaceCount.onClick = function () {
+        cfg.useFaceCount = !!this.value;
     };
 
     bindSlider(rowVT, function (v) { cfg.vTop = v; });
@@ -1074,6 +1099,7 @@ function formatPercent(v) {
 function Config() {
     var settingsObj = this;
     this.engine = '';
+    this.useFaceCount = true;
     // Defaults exactly reproduce the original hard-coded margins.
     this.vTop = 5;
     this.vBottom = 10;
@@ -1125,7 +1151,7 @@ function Config() {
 
         function objectToDescriptor(o) {
             var desc = new ActionDescriptor(),
-                keys = ['engine', 'vTop', 'vBottom', 'vSide', 'hTop', 'hBottom', 'hSide'];
+                keys = ['engine', 'useFaceCount', 'vTop', 'vBottom', 'vSide', 'hTop', 'hBottom', 'hSide'];
 
             for (var i = 0; i < keys.length; i++) {
                 var key = keys[i], id = app.stringIDToTypeID(key), value = o[key];
@@ -1175,13 +1201,14 @@ function Locale() {
     this.okButton = { ru: '\u0412\u044B\u043F\u043E\u043B\u043D\u0438\u0442\u044C', en: 'Run' };
     this.save = { ru: '\u0421\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438', en: 'Save settings' };
     this.cancel = { ru: '\u041E\u0442\u043C\u0435\u043D\u0430', en: 'Cancel' };
+    this.useFaceCount = { ru: '\u0423\u0447\u0438\u0442\u044B\u0432\u0430\u0442\u044C \u043A\u043E\u043B\u0438\u0447\u0435\u0441\u0442\u0432\u043E \u043B\u0438\u0446 \u043F\u0440\u0438 \u043F\u043E\u0434\u0431\u043E\u0440\u0435 \u0440\u0430\u043C\u043E\u043A', en: 'Use face count when matching frames' };
     this.enginePython = { ru: 'Python', en: 'Python' };
     this.engineDevice = { ru: 'autoCutout \u2014 on device', en: 'autoCutout \u2014 on device' };
     this.engineCloud = { ru: 'autoCutout \u2014 in cloud', en: 'autoCutout \u2014 in cloud' };
     this.engineLayer = { ru: '\u0413\u0440\u0430\u043D\u0438\u0446\u044B \u0441\u043B\u043E\u044F', en: 'Layer bounds' };
     this.descPython = {
-        ru: '\u0411\u044B\u0441\u0442\u0440\u044B\u0439 \u0430\u043D\u0430\u043B\u0438\u0437 \u0443\u043C\u0435\u043D\u044C\u0448\u0435\u043D\u043D\u044B\u0445 \u0438\u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u0438\u0439 \u0432\u043D\u0435\u0448\u043D\u0438\u043C \u043C\u043E\u0434\u0443\u043B\u0435\u043C. \u041E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442 \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u0433\u0440\u0443\u043F\u043F\u044B \u0438 \u043F\u0440\u0438\u043C\u0435\u0440\u043D\u043E\u0435 \u0447\u0438\u0441\u043B\u043E \u043B\u0438\u0446. \u0427\u0438\u0441\u043B\u043E \u043B\u0438\u0446 \u0434\u043E\u043F\u043E\u043B\u043D\u0438\u0442\u0435\u043B\u044C\u043D\u043E \u0443\u0447\u0438\u0442\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u043F\u0440\u0438 \u0440\u0430\u0441\u043F\u0440\u0435\u0434\u0435\u043B\u0435\u043D\u0438\u0438 \u043A\u0430\u0434\u0440\u043E\u0432 \u043F\u043E \u0440\u0430\u0437\u043C\u0435\u0440\u0443 \u0440\u0430\u043C\u043E\u043A.',
-        en: 'Fast external analysis of reduced previews. Detects the group bounds and an approximate face count. Face count is also used when matching photos to frame sizes.'
+        ru: '\u0411\u044B\u0441\u0442\u0440\u044B\u0439 \u0430\u043D\u0430\u043B\u0438\u0437 \u0443\u043C\u0435\u043D\u044C\u0448\u0435\u043D\u043D\u044B\u0445 \u0438\u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u0438\u0439 \u0432\u043D\u0435\u0448\u043D\u0438\u043C \u043C\u043E\u0434\u0443\u043B\u0435\u043C. \u041E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442 \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u0433\u0440\u0443\u043F\u043F\u044B \u0438 \u043F\u0440\u0438\u043C\u0435\u0440\u043D\u043E\u0435 \u0447\u0438\u0441\u043B\u043E \u043B\u0438\u0446. \u041F\u0440\u0438 \u0432\u043A\u043B\u044E\u0447\u0435\u043D\u043D\u043E\u0439 \u043E\u043F\u0446\u0438\u0438 \u0447\u0438\u0441\u043B\u043E \u043B\u0438\u0446 \u0443\u0447\u0438\u0442\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u043F\u0440\u0438 \u043F\u043E\u0434\u0431\u043E\u0440\u0435 \u0440\u0430\u043C\u043E\u043A.',
+        en: 'Fast external analysis of reduced previews. Detects the group bounds and an approximate face count. When enabled, face count is also used when matching photos to frames.'
     };
     this.descDevice = {
         ru: 'Photoshop Select Subject: \u043E\u0431\u0440\u0430\u0431\u043E\u0442\u043A\u0430 \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u043E \u043D\u0430 \u0443\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432\u0435. \u0411\u044B\u0441\u0442\u0440\u0435\u0435 Cloud, \u043D\u043E \u043E\u0431\u044B\u0447\u043D\u043E \u043C\u0435\u043D\u0435\u0435 \u0442\u043E\u0447\u043D\u043E \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442 \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u043E\u0431\u044A\u0435\u043A\u0442\u0430. \u0427\u0438\u0441\u043B\u043E \u043B\u0438\u0446 \u043D\u0435 \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442\u0441\u044F.',
