@@ -17,14 +17,14 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = 0.522,
+var SCRIPT_VERSION = '0.5.24',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
     API_PORT_LISTEN = 6321,
     API_FILES = ['lib/align-fit-api.pyw', 'align-fit-api.pyw'],
     RUNTIME_NAME = 'AlignFitRuntime',
-    EXPECTED_SERVER_VERSION = '0.4.3',
+    EXPECTED_SERVER_VERSION = '0.4.4',
     PREVIEW_MAX = 1280,
     FINAL_BLEED_PX = 2,
     INIT_DELAY = 15000,
@@ -577,6 +577,9 @@ function subjectFromLocalAnalysis(id, analysis, fromPython) {
                 bottom: Number(layerBounds.top) + Number(b[3]) * sy,
                 faces: fromPython ? (Number(analysis.faces) || 0) : 0
             };
+        if (fromPython && isFiniteNumber(Number(analysis.visual_center_x))) {
+            subject.visualCenterX = Number(layerBounds.left) + Number(analysis.visual_center_x) * sx;
+        }
         subject.width = subject.right - subject.left;
         subject.height = subject.bottom - subject.top;
         if (!(subject.width > 1) || !(subject.height > 1)) return null;
@@ -597,6 +600,7 @@ function subjectFromLayerBounds(id) {
         width: Number(b.width), height: Number(b.height), faces: 0
     };
     subject.center = { y: subject.top + subject.height / 2, x: subject.left + subject.width / 2 };
+    subject.visualCenterX = subject.center.x;
     subject.vertical = subject.height > subject.width;
     subject.ratio = subject.width / subject.height;
     // Layer-bounds mode has no object offsets: the complete layer is the geometry.
@@ -1283,6 +1287,9 @@ function finishSubjectGeometry(subject, layerBounds) {
         subject.height = subject.bottom - subject.top;
         if (subject.width <= 1 || subject.height <= 1) return null;
         subject.center = { y: subject.top + subject.height / 2, x: subject.left + subject.width / 2 };
+        if (!isFiniteNumber(Number(subject.visualCenterX))) subject.visualCenterX = subject.center.x;
+        if (subject.visualCenterX < subject.left) subject.visualCenterX = subject.left;
+        if (subject.visualCenterX > subject.right) subject.visualCenterX = subject.right;
         subject.vertical = subject.height > subject.width;
         subject.ratio = subject.width / subject.height;
 
@@ -1472,6 +1479,8 @@ function getObjectPlacementSolution(subject, frame) {
         localTop = Math.max(0, Number(subject.top) - Number(layer.top)),
         localRight = Math.min(layerW, Number(subject.right) - Number(layer.left)),
         localBottom = Math.min(layerH, Number(subject.bottom) - Number(layer.top)),
+        visualCenterLocalX = isFiniteNumber(Number(subject.visualCenterX)) ?
+            Number(subject.visualCenterX) - Number(layer.left) : (localLeft + localRight) / 2,
         rightSpace = Math.max(0, layerW - localRight),
         bottomSpace = Math.max(0, layerH - localBottom),
         desiredTop = frameH * ((frame.vertical ? cfg.vTop : cfg.hTop) / 100),
@@ -1479,6 +1488,8 @@ function getObjectPlacementSolution(subject, frame) {
         desiredSide = frameW * ((frame.vertical ? cfg.vSide : cfg.hSide) / 100),
         preferredBleed = FINAL_BLEED_PX > 0 ? FINAL_BLEED_PX : 0,
         eps = 0.000001;
+
+    visualCenterLocalX = Math.max(localLeft, Math.min(localRight, visualCenterLocalX));
 
     function clampValue(v, lo, hi) {
         return v < lo ? lo : (v > hi ? hi : v);
@@ -1500,7 +1511,17 @@ function getObjectPlacementSolution(subject, frame) {
         // lower part to leave the frame. This mirrors the intent of the original
         // script for portraits and prevents a full-body detection from producing
         // an unnaturally small person in a tighter frame.
-        var sMax = innerW / subjectW;
+        // Center the visual anchor, then choose the largest scale that keeps the
+        // detected envelope inside the requested side margins. When the visual
+        // center is not the geometric bbox center, one side will naturally have
+        // more free space; shrinking slightly is preferable to shifting the person.
+        var halfInnerW = innerW / 2,
+            visualLeft = visualCenterLocalX - localLeft,
+            visualRight = localRight - visualCenterLocalX,
+            sMax = Number.POSITIVE_INFINITY;
+        if (visualLeft > eps) sMax = Math.min(sMax, halfInnerW / visualLeft);
+        if (visualRight > eps) sMax = Math.min(sMax, halfInnerW / visualRight);
+        if (!isFiniteNumber(sMax)) sMax = innerW / subjectW;
         if (!(sMax > 0)) return null;
         if (subjectH * sMax > innerH + eps) return null;
 
@@ -1544,10 +1565,9 @@ function getObjectPlacementSolution(subject, frame) {
 
         if (xLow > xHigh + eps || yLow > yHigh + eps) return null;
 
-        var objectCenterLocalX = (localLeft + localRight) / 2,
-            objectCenterLocalY = (localTop + localBottom) / 2,
+        var objectCenterLocalY = (localTop + localBottom) / 2,
             safeCenterY = Number(frame.top) + topMargin + innerH / 2,
-            preferredX = Number(frame.center.x) - scale * objectCenterLocalX,
+            preferredX = Number(frame.center.x) - scale * visualCenterLocalX,
             preferredY = safeCenterY - scale * objectCenterLocalY;
 
         return {
@@ -1564,12 +1584,13 @@ function getObjectPlacementSolution(subject, frame) {
             localLeft: localLeft,
             localTop: localTop,
             localRight: localRight,
-            localBottom: localBottom
+            localBottom: localBottom,
+            visualCenterLocalX: visualCenterLocalX
         };
     }
 
     function solveOversized(bleed) {
-        var anchorLocalX = (localLeft + localRight) / 2,
+        var anchorLocalX = visualCenterLocalX,
             leftFromAnchor = anchorLocalX,
             rightFromAnchor = layerW - anchorLocalX,
             belowTopAnchor = layerH - localTop;
@@ -1582,12 +1603,21 @@ function getObjectPlacementSolution(subject, frame) {
             // not from whichever image edge happens to be closest to the frame.
             // The layer-cover requirement may enlarge it further, but must never
             // make the photograph edge the primary alignment target.
-            scaleObjectX = innerW > eps ? innerW / subjectW : frameW / subjectW,
-            scaleLR = Math.max(
-                (targetX - (Number(frame.left) - bleed)) / leftFromAnchor,
-                ((Number(frame.right) + bleed) - targetX) / rightFromAnchor
-            ),
-            scaleDesired = Math.max(
+            visualLeft = anchorLocalX - localLeft,
+            visualRight = localRight - anchorLocalX,
+            halfInnerW = Math.max(eps, innerW / 2),
+            scaleObjectX = Number.POSITIVE_INFINITY,
+            scaleLR;
+
+        if (visualLeft > eps) scaleObjectX = Math.min(scaleObjectX, halfInnerW / visualLeft);
+        if (visualRight > eps) scaleObjectX = Math.min(scaleObjectX, halfInnerW / visualRight);
+        if (!isFiniteNumber(scaleObjectX)) scaleObjectX = innerW > eps ? innerW / subjectW : frameW / subjectW;
+
+        scaleLR = Math.max(
+            (targetX - (Number(frame.left) - bleed)) / leftFromAnchor,
+            ((Number(frame.right) + bleed) - targetX) / rightFromAnchor
+        );
+        var scaleDesired = Math.max(
                 scaleObjectX,
                 scaleLR,
                 (frameH + bleed - desiredTop) / belowTopAnchor
@@ -1654,7 +1684,8 @@ function getObjectPlacementSolution(subject, frame) {
             localLeft: localLeft,
             localTop: localTop,
             localRight: localRight,
-            localBottom: localBottom
+            localBottom: localBottom,
+            visualCenterLocalX: visualCenterLocalX
         };
     }
 
@@ -1692,7 +1723,7 @@ function objectPlacementCost(subject, frame) {
     if (!solution.oversized) {
         var preferredCenterX = Number(frame.center.x),
             preferredCenterY = Number(frame.top) + Number(solution.desiredTop) + innerH / 2,
-            actualCenterX = (objectLeft + objectRight) / 2,
+            actualCenterX = Number(solution.tx) + scale * Number(solution.visualCenterLocalX),
             actualCenterY = (objectTop + objectBottom) / 2,
             centerDx = Math.abs(actualCenterX - preferredCenterX) / Math.max(1, frameW),
             centerDy = Math.abs(actualCenterY - preferredCenterY) / Math.max(1, frameH);
@@ -1722,15 +1753,41 @@ function alignLayer(subject, frame) {
     var solution = getObjectPlacementSolution(subject, frame);
     if (!solution) throw new Error('Invalid object/frame geometry.');
 
+    // Apply the already solved final geometry using a transform anchor that
+    // belongs to the detected object, not to the complete photo layer. This is
+    // intentionally close to the original script's transform model:
+    //   - normal fit: scale around the object's center;
+    //   - oversized fit: scale around the top-center of the object.
+    // The target point is derived from solution.tx/ty, so changing the anchor
+    // does not change the placement solver's final geometry; it only makes the
+    // Photoshop transform itself preserve the important object point directly.
     var layer = subject.layer,
-        layerW = Number(layer.width),
-        layerH = Number(layer.height),
-        targetLayerCenterX = solution.tx + solution.scale * layerW / 2,
-        targetLayerCenterY = solution.ty + solution.scale * layerH / 2,
-        dX = targetLayerCenterX - Number(layer.center.x),
-        dY = targetLayerCenterY - Number(layer.center.y);
+        scale = Number(solution.scale),
+        anchorX, anchorY,
+        targetX, targetY;
 
-    lr.transform(dX, dY, solution.scale * 100, Number(layer.center.x), Number(layer.center.y));
+    if (solution.oversized) {
+        // Portraits and groups that cannot be fully contained are enlarged from
+        // their top-center. The whole detected group therefore stays centered
+        // horizontally while the top of the group remains the vertical anchor.
+        anchorX = isFiniteNumber(Number(subject.visualCenterX)) ? Number(subject.visualCenterX) : (Number(subject.left) + Number(subject.right)) / 2;
+        anchorY = Number(subject.top);
+        targetX = Number(solution.tx) + scale * ((anchorX - Number(layer.left)));
+        targetY = Number(solution.ty) + scale * ((anchorY - Number(layer.top)));
+    } else {
+        // For a normal fit the detected object's center is the transform anchor.
+        // If cover constraints forced a minimal shift, targetX/targetY reproduce
+        // that solved center exactly rather than re-centering the photo layer.
+        anchorX = isFiniteNumber(Number(subject.visualCenterX)) ? Number(subject.visualCenterX) : Number(subject.center.x);
+        anchorY = Number(subject.center.y);
+        targetX = Number(solution.tx) + scale * ((anchorX - Number(layer.left)));
+        targetY = Number(solution.ty) + scale * ((anchorY - Number(layer.top)));
+    }
+
+    var dX = targetX - anchorX,
+        dY = targetY - anchorY;
+
+    lr.transform(dX, dY, scale * 100, anchorX, anchorY);
 }
 function AM(target, order) {
     var s2t = stringIDToTypeID,

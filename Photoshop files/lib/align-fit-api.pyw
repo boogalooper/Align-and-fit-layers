@@ -10,7 +10,7 @@ API_HOST = "127.0.0.1"
 API_PORT_SEND = 6321       # Python -> JSX
 API_PORT_LISTEN = 6320     # JSX -> Python
 TIMEOUT = 15 * 60
-SERVER_VERSION = "0.4.3"
+SERVER_VERSION = "0.4.4"
 
 # Models are installed with the private runtime, outside the Photoshop folder.
 # sys.prefix points to the active venv when the server is started by launcher.vbs.
@@ -170,27 +170,74 @@ def clamp_bbox(box, w, h):
     return [x1, y1, x2, y2]
 
 
-def bbox_from_human_mask(mask, np, cv2):
+def human_geometry_from_mask(mask, np, cv2):
+    """Return the retained human envelope and its foreground center of mass on X."""
     h, w = mask.shape[:2]
     binary = (mask > 0).astype(np.uint8)
     foreground = int(binary.sum())
     if foreground <= 0:
-        return None
+        return None, None
 
-    num, _labels, stats, _centroids = cv2.connectedComponentsWithStats(binary, 8)
+    num, _labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
     min_area = max(20, int(round(w * h * MASK_MIN_COMPONENT_FRAC)))
     kept = []
+    kept_area = 0.0
+    weighted_x = 0.0
     for i in range(1, num):
         x, y, cw, ch, area = [int(v) for v in stats[i]]
         if area < min_area or cw < 3 or ch < 3:
             continue
         kept.append([float(x), float(y), float(x + cw), float(y + ch)])
+        kept_area += float(area)
+        weighted_x += float(centroids[i][0]) * float(area)
 
     if not kept:
-        return None
+        return None, None
     if float(foreground) / float(max(1, w * h)) > MASK_MAX_COVERAGE:
+        return None, None
+    center_x = weighted_x / kept_area if kept_area > 0 else None
+    return union_boxes(kept), center_x
+
+
+def visual_center_x(mask_bbox, mask_center_x, face_boxes):
+    """Estimate a stable horizontal visual center for a person or a group.
+
+    The segmentation center of mass is the stable base. Detected faces nudge it
+    toward where viewers naturally perceive people: a single face has moderate
+    influence; a group uses the equal-weight mean of face centers more strongly.
+    Faces clearly outside the segmented group are ignored.
+    """
+    if mask_bbox is None:
         return None
-    return union_boxes(kept)
+
+    x1, y1, x2, y2 = [float(v) for v in mask_bbox]
+    bbox_center = (x1 + x2) * 0.5
+    base = float(mask_center_x) if mask_center_x is not None and math.isfinite(float(mask_center_x)) else bbox_center
+
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    pad_x = max(6.0, bw * 0.15)
+    pad_y = max(6.0, bh * 0.20)
+    centers = []
+    for box in face_boxes or []:
+        fx1, fy1, fx2, fy2 = [float(v) for v in box]
+        cx = (fx1 + fx2) * 0.5
+        cy = (fy1 + fy2) * 0.5
+        if x1 - pad_x <= cx <= x2 + pad_x and y1 - pad_y <= cy <= y2 + pad_y:
+            centers.append(cx)
+
+    if centers:
+        face_center = sum(centers) / float(len(centers))
+        # Keep the result stable when only one face is visible, but let a set of
+        # faces describe a group's visual center with equal weight per person.
+        face_weight = 0.65 if len(centers) >= 2 else 0.55
+        result = face_center * face_weight + base * (1.0 - face_weight)
+    else:
+        result = base
+
+    # Never allow an imperfect face detection to pull the anchor outside the
+    # actual detected human envelope.
+    return max(x1, min(x2, result))
 
 
 def analyze_image(path):
@@ -204,7 +251,7 @@ def analyze_image(path):
         human_mask = human_segmenter.mask(image)
         face_detections = face_detector.detect(image)
 
-    bbox = bbox_from_human_mask(human_mask, np, cv2)
+    bbox, mask_center_x = human_geometry_from_mask(human_mask, np, cv2)
     face_boxes = face_detections
 
     # Refine the coarse 192x192 segmentation only around the detected group. This keeps
@@ -221,7 +268,7 @@ def analyze_image(path):
             crop = image[cy1:cy2, cx1:cx2]
             with model_lock:
                 refined_mask = human_segmenter.mask(crop)
-            refined = bbox_from_human_mask(refined_mask, np, cv2)
+            refined, refined_center_x = human_geometry_from_mask(refined_mask, np, cv2)
             if refined is not None:
                 bbox = [
                     refined[0] + cx1,
@@ -229,6 +276,13 @@ def analyze_image(path):
                     refined[2] + cx1,
                     refined[3] + cy1,
                 ]
+                if refined_center_x is not None:
+                    mask_center_x = refined_center_x + cx1
+
+    # Compute the horizontal visual center from the human mask plus face positions
+    # before face boxes expand the outer envelope. This keeps a stray face box from
+    # redefining the composition while still allowing valid heads to extend the bbox.
+    visual_x = visual_center_x(bbox, mask_center_x, face_boxes)
 
     # The segmentation model can occasionally trim hair/head edges. Face boxes are
     # therefore allowed to expand the group envelope, but never replace a missing mask.
@@ -247,9 +301,15 @@ def analyze_image(path):
             h,
         )
 
+    if bbox is not None:
+        if visual_x is None or not math.isfinite(float(visual_x)):
+            visual_x = (bbox[0] + bbox[2]) * 0.5
+        visual_x = max(float(bbox[0]), min(float(bbox[2]), float(visual_x)))
+
     return {
         "bbox": bbox,
         "faces": len(face_boxes),
+        "visual_center_x": visual_x,
         "width": int(w),
         "height": int(h),
     }
@@ -523,6 +583,7 @@ def handle_client(client_socket, server):
                                 "error": str(exc),
                                 "bbox": None,
                                 "faces": 0,
+                                "visual_center_x": None,
                             }
                         )
                     finally:
