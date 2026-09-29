@@ -17,7 +17,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = 0.521,
+var SCRIPT_VERSION = 0.522,
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
@@ -1492,8 +1492,17 @@ function getObjectPlacementSolution(subject, frame) {
             innerH = frameH - topMargin - bottomMargin;
         if (!(innerW > 0) || !(innerH > 0)) return null;
 
-        var sMax = Math.min(innerW / subjectW, innerH / subjectH);
+        // Horizontal composition is the primary scale rule. If fitting the
+        // detected object to the requested side margins would make it too tall
+        // for the vertical working area, this is not a reason to shrink the
+        // object until it fits. It is the normal "oversized subject" case:
+        // keep the object centered horizontally, anchor its top and allow the
+        // lower part to leave the frame. This mirrors the intent of the original
+        // script for portraits and prevents a full-body detection from producing
+        // an unnaturally small person in a tighter frame.
+        var sMax = innerW / subjectW;
         if (!(sMax > 0)) return null;
+        if (subjectH * sMax > innerH + eps) return null;
 
         var sMin = Math.max((frameW + bleed * 2) / layerW, (frameH + bleed * 2) / layerH),
             need;
@@ -1568,11 +1577,18 @@ function getObjectPlacementSolution(subject, frame) {
         if (!(leftFromAnchor > eps) || !(rightFromAnchor > eps) || !(belowTopAnchor > eps)) return null;
 
         var targetX = Number(frame.center.x),
+            innerW = frameW - desiredSide * 2,
+            // First establish the object scale from its horizontal composition,
+            // not from whichever image edge happens to be closest to the frame.
+            // The layer-cover requirement may enlarge it further, but must never
+            // make the photograph edge the primary alignment target.
+            scaleObjectX = innerW > eps ? innerW / subjectW : frameW / subjectW,
             scaleLR = Math.max(
                 (targetX - (Number(frame.left) - bleed)) / leftFromAnchor,
                 ((Number(frame.right) + bleed) - targetX) / rightFromAnchor
             ),
             scaleDesired = Math.max(
+                scaleObjectX,
                 scaleLR,
                 (frameH + bleed - desiredTop) / belowTopAnchor
             ),
@@ -1587,7 +1603,7 @@ function getObjectPlacementSolution(subject, frame) {
             topMargin = desiredTop;
         } else {
             if (localTop <= eps && bleed > 0) return null;
-            scale = Math.max(scaleLR, (frameH + bleed * 2) / layerH);
+            scale = Math.max(scaleObjectX, scaleLR, (frameH + bleed * 2) / layerH);
             if (localTop > eps) scale = Math.max(scale, bleed / localTop);
             topMargin = localTop * scale - bleed;
             if (topMargin < 0) topMargin = 0;
