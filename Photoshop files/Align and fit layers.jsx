@@ -17,14 +17,14 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.5.24',
+var SCRIPT_VERSION = '0.5.26',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
     API_PORT_LISTEN = 6321,
     API_FILES = ['lib/align-fit-api.pyw', 'align-fit-api.pyw'],
     RUNTIME_NAME = 'AlignFitRuntime',
-    EXPECTED_SERVER_VERSION = '0.4.4',
+    EXPECTED_SERVER_VERSION = '0.4.5',
     PREVIEW_MAX = 1280,
     FINAL_BLEED_PX = 2,
     INIT_DELAY = 15000,
@@ -410,7 +410,10 @@ function prepareAutoCutoutChunk(i) {
     if (!lr.getProperty('visible')) lr.setLayerVisiblity(id, true);
     runCtx.previewTouched = true;
     var measured = measureAutoCutoutInSmartObject(runCtx.sourceDoc, id);
-    if (!measured || !measured.bbox) throw new Error(L(str.errNoSubject) + ': ' + name);
+    // A layer on which Select Subject found nothing is not fatal. Keep a result
+    // entry so collectSubjectChunk() can fall back to this layer's own bounds
+    // without changing the engine for the rest of the selection.
+    if (!measured) measured = { id: id, bbox: null };
     runCtx.analysisMap[String(id)] = measured;
     app.changeProgressText(text);
     $.sleep(0);
@@ -444,20 +447,19 @@ function measureAutoCutoutInSmartObject(sourceDoc, id) {
 
         stage = 'Select Subject';
         lr.autoCutout();
-        if (!doc.hasProperty('selection')) throw new Error(L(str.errNoSubject));
-        var b = doc.descToObject(doc.getProperty('selection'));
-        lr.deselect();
-        if (!b || !(Number(b.right) > Number(b.left)) || !(Number(b.bottom) > Number(b.top))) {
-            throw new Error(L(str.errNoSubject));
+        var b = null;
+        if (doc.hasProperty('selection')) {
+            b = doc.descToObject(doc.getProperty('selection'));
+            lr.deselect();
+            if (!b || !(Number(b.right) > Number(b.left)) || !(Number(b.bottom) > Number(b.top))) b = null;
         }
 
         var out = {
             id: id,
             width: localW,
             height: localH,
-            bbox: [Number(b.left), Number(b.top), Number(b.right), Number(b.bottom)],
-            faces: 0,
-            bbox_source: cfg.engine == 'cloud' ? 'autoCutout-cloud' : 'autoCutout-device'
+            bbox: b ? [Number(b.left), Number(b.top), Number(b.right), Number(b.bottom)] : null,
+            faces: 0
         };
 
         stage = 'close Smart Object contents';
@@ -538,14 +540,24 @@ function collectSubjectChunk(i) {
     if (cfg.engine == 'python') {
         var analysis = runCtx.analysisMap[String(id)];
         if (!analysis) throw new Error('Python returned no result for layer: ' + layerName);
-        if (analysis.error) throw new Error('Python analysis failed for layer "' + layerName + '": ' + analysis.error);
-        if (!analysis.bbox || !analysis.width || !analysis.height) throw new Error('Python did not find an object bounding box for layer: ' + layerName);
-        subject = subjectFromLocalAnalysis(id, analysis, true);
-        if (!subject) throw new Error('Invalid Python bounding box for layer: ' + layerName);
+        if (!analysis.error && analysis.bbox && analysis.width && analysis.height) {
+            subject = subjectFromLocalAnalysis(id, analysis, true);
+        }
+        // Detection failure is local to this photo. Use complete layer bounds for
+        // this one subject, while all other photos keep the selected Python mode.
+        if (!subject) {
+            subject = subjectFromLayerBounds(id);
+            if (!subject) throw new Error(L(str.errLayerBounds) + ': ' + layerName);
+        }
     } else if (cfg.engine == 'device' || cfg.engine == 'cloud') {
         var measured = runCtx.analysisMap[String(id)];
         subject = subjectFromLocalAnalysis(id, measured, false);
-        if (!subject) throw new Error(L(str.errNoSubject) + ': ' + layerName);
+        // Select Subject returning no usable object is also a per-layer fallback,
+        // not a reason to switch or abort the complete batch.
+        if (!subject) {
+            subject = subjectFromLayerBounds(id);
+            if (!subject) throw new Error(L(str.errLayerBounds) + ': ' + layerName);
+        }
     } else {
         subject = subjectFromLayerBounds(id);
         if (!subject) throw new Error(L(str.errLayerBounds) + ': ' + layerName);
@@ -584,7 +596,6 @@ function subjectFromLocalAnalysis(id, analysis, fromPython) {
         subject.height = subject.bottom - subject.top;
         if (!(subject.width > 1) || !(subject.height > 1)) return null;
         subject.center = { y: subject.top + subject.height / 2, x: subject.left + subject.width / 2 };
-        subject.vertical = subject.height > subject.width;
         subject.ratio = subject.width / subject.height;
         return finishSubjectGeometry(subject, layerBounds);
     } catch (e) {
@@ -601,11 +612,11 @@ function subjectFromLayerBounds(id) {
     };
     subject.center = { y: subject.top + subject.height / 2, x: subject.left + subject.width / 2 };
     subject.visualCenterX = subject.center.x;
-    subject.vertical = subject.height > subject.width;
     subject.ratio = subject.width / subject.height;
-    // Layer-bounds mode has no object offsets: the complete layer is the geometry.
+    subject.boundsOnly = true;
+    // Layer-bounds mode and per-layer detection fallback have no object offsets:
+    // the complete layer is the geometry.
     subject.layer = b;
-    subject.layer.center = { y: Number(b.top) + Number(b.height) / 2, x: Number(b.left) + Number(b.width) / 2 };
     return subject;
 }
 
@@ -715,7 +726,7 @@ function matchFramesStage() {
             var placementCosts = {};
             for (var pc = 0; pc < runCtx.frames.length; pc++) {
                 if (String(runCtx.frames[pc].color) != String(runCtx.subjects[i].color)) continue;
-                placementCosts[String(runCtx.frames[pc].id)] = objectPlacementCost(runCtx.subjects[i], runCtx.frames[pc]);
+                placementCosts[String(runCtx.frames[pc].id)] = subjectFrameMatchCost(runCtx.subjects[i], runCtx.frames[pc]);
             }
             matchSubjects.push({
                 id: runCtx.subjects[i].id,
@@ -723,6 +734,7 @@ function matchFramesStage() {
                 ratio: runCtx.subjects[i].ratio,
                 faces: runCtx.subjects[i].faces ? runCtx.subjects[i].faces : 0,
                 bbox_area: runCtx.subjects[i].width * runCtx.subjects[i].height,
+                bounds_only: !!runCtx.subjects[i].boundsOnly,
                 placement_costs: placementCosts
             });
         }
@@ -789,7 +801,7 @@ function alignSubjectChunk(i) {
         frame = baseId ? findFrameById(runCtx.frames, baseId) : null;
         if (!frame) throw new Error('Cannot read clipping-base frame for layer: ' + layerName);
         lr.selectLayer(subject.id);
-        if (cfg.engine == 'layer') alignLayerBounds(subject, frame); else alignLayer(subject, frame);
+        if (usesLayerBoundsPlacement(subject)) alignLayerBounds(subject, frame); else alignLayer(subject, frame);
     } else {
         if (runCtx.selectedFallback) {
             frame = runCtx.frames.length ? runCtx.frames[0] : null;
@@ -808,9 +820,13 @@ function alignSubjectChunk(i) {
     $.sleep(0);
 }
 
+function usesLayerBoundsPlacement(subject) {
+    return cfg.engine == 'layer' || !!(subject && subject.boundsOnly);
+}
+
 function alignSubjectInPlace(subject, frame) {
     lr.selectLayer(subject.id);
-    if (cfg.engine == 'layer') alignLayerBounds(subject, frame);
+    if (usesLayerBoundsPlacement(subject)) alignLayerBounds(subject, frame);
     else alignLayer(subject, frame);
 }
 
@@ -823,8 +839,9 @@ function moveAndAlignSubject(subject, frame) {
     lr.selectLayer(subject.id);
 
     // Layer-bounds Cover must be computed before clipping changes visible bounds.
-    // Object-based engines keep the original order from the source script.
-    if (cfg.engine == 'layer') {
+    // This applies both to the explicit Layer bounds engine and to an individual
+    // photo that fell back because object detection failed.
+    if (usesLayerBoundsPlacement(subject)) {
         alignLayerBounds(subject, frame);
         if (!lr.getProperty('group', false, subject.id)) lr.groupCurrentLayer();
     } else {
@@ -839,7 +856,19 @@ function undoPreviewHistory(sourceDoc) {
     app.activeDocument = sourceDoc;
 }
 
-function matchByPlacement(subjects, frames) {
+function layerBoundsMatchCost(subject, frame) {
+    var sr = Math.max(1e-6, Number(subject.ratio) || 1),
+        fr = Math.max(1e-6, Number(frame.ratio) || 1),
+        sv = sr < 1,
+        fv = fr < 1;
+    return Math.abs(Math.log(sr / fr)) * 12 + (sv != fv ? 4 : 0);
+}
+
+function subjectFrameMatchCost(subject, frame) {
+    return subject && subject.boundsOnly ? layerBoundsMatchCost(subject, frame) : objectPlacementCost(subject, frame);
+}
+
+function matchByCost(subjects, frames, costFn) {
     var groups = {}, result = {};
     for (var i = 0; i < subjects.length; i++) {
         var sc = String(subjects[i].color);
@@ -857,7 +886,7 @@ function matchByPlacement(subjects, frames) {
         var matrix = [];
         for (var si = 0; si < gs.length; si++) {
             var row = [];
-            for (var fi = 0; fi < gf.length; fi++) row.push(objectPlacementCost(gs[si], gf[fi]));
+            for (var fi = 0; fi < gf.length; fi++) row.push(costFn(gs[si], gf[fi]));
             matrix.push(row);
         }
         var assignment = hungarian(matrix);
@@ -868,36 +897,12 @@ function matchByPlacement(subjects, frames) {
     return result;
 }
 
+function matchByPlacement(subjects, frames) {
+    return matchByCost(subjects, frames, subjectFrameMatchCost);
+}
+
 function matchByRatio(subjects, frames) {
-    var groups = {}, result = {};
-    for (var i = 0; i < subjects.length; i++) {
-        var sc = String(subjects[i].color);
-        if (!groups[sc]) groups[sc] = { subjects: [], frames: [] };
-        groups[sc].subjects.push(subjects[i]);
-    }
-    for (var j = 0; j < frames.length; j++) {
-        var fc = String(frames[j].color);
-        if (!groups[fc]) groups[fc] = { subjects: [], frames: [] };
-        groups[fc].frames.push(frames[j]);
-    }
-    for (var key in groups) {
-        var gs = groups[key].subjects, gf = groups[key].frames;
-        if (!gs.length || !gf.length) continue;
-        var matrix = [];
-        for (var si = 0; si < gs.length; si++) {
-            var row = [], sr = Math.max(1e-6, Number(gs[si].ratio) || 1), sv = sr < 1;
-            for (var fi = 0; fi < gf.length; fi++) {
-                var fr = Math.max(1e-6, Number(gf[fi].ratio) || 1), fv = fr < 1;
-                row.push(Math.abs(Math.log(sr / fr)) * 12 + (sv != fv ? 4 : 0));
-            }
-            matrix.push(row);
-        }
-        var assignment = hungarian(matrix);
-        for (var ai = 0; ai < assignment.length; ai++) {
-            if (assignment[ai] >= 0) result[String(gs[ai].id)] = gf[assignment[ai]].id;
-        }
-    }
-    return result;
+    return matchByCost(subjects, frames, layerBoundsMatchCost);
 }
 
 function hungarian(cost) {
@@ -956,7 +961,6 @@ function getCapabilities() {
         hasAuto = versionAtLeast(v, 19, 1),
         hasCloud = versionAtLeast(v, 23, 5);
     return {
-        version: v,
         python: false,
         autoCutout: hasAuto,
         cloud: hasAuto && hasCloud,
@@ -1030,9 +1034,9 @@ function showFrameShortageWarning(shortage, missingTotal, totalLayers) {
     var dlg = new Window("dialog{orientation:'column',alignChildren:['fill','top'],spacing:10,margins:16}"),
         msg = dlg.add("statictext{properties:{multiline:true},preferredSize:[430,125]}"),
         details = dlg.add("statictext{properties:{multiline:true},preferredSize:[430,70]}"),
-        buttons = dlg.add("group{orientation:'row',alignment:['center','top'],spacing:10}"),
-        proceed = buttons.add('button', undefined, L(str.continueButton), { name: 'ok' }),
-        stop = buttons.add('button', undefined, L(str.stopButton), { name: 'cancel' });
+        buttons = dlg.add("group{orientation:'row',alignment:['center','top'],spacing:10}");
+    buttons.add('button', undefined, L(str.continueButton), { name: 'ok' });
+    buttons.add('button', undefined, L(str.stopButton), { name: 'cancel' });
     dlg.text = L(str.warningTitle);
     msg.text = L(str.warnFrameCount).replace('%MISSING%', missingTotal).replace('%TOTAL%', totalLayers);
     details.text = L(str.warnFrameDetails) + '\n' + shortage.join(', ');
@@ -1215,7 +1219,6 @@ function Locale() {
     this.err = { ru: '\u0421\u043A\u0440\u0438\u043F\u0442 \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D', en: 'Script stopped' };
     this.errDoc = { ru: '\u041D\u0435\u0442 \u0430\u043A\u0442\u0438\u0432\u043D\u043E\u0433\u043E \u0434\u043E\u043A\u0443\u043C\u0435\u043D\u0442\u0430!', en: 'No active document!' };
     this.errLayers = { ru: '\u041D\u0435 \u0432\u044B\u0431\u0440\u0430\u043D\u044B \u0441\u043B\u043E\u0438 \u0434\u043B\u044F \u0432\u044B\u0440\u0430\u0432\u043D\u0438\u0432\u0430\u043D\u0438\u044F.', en: 'No layers are selected for alignment.' };
-    this.errNoSubject = { ru: 'Photoshop \u043D\u0435 \u0441\u043C\u043E\u0433 \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u0438\u0442\u044C \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u043E\u0431\u044A\u0435\u043A\u0442\u0430', en: 'Photoshop could not detect object bounds' };
     this.errLayerBounds = { ru: '\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u044C \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u0441\u043B\u043E\u044F', en: 'Cannot read layer bounds' };
     this.errCloudMode = { ru: '\u041E\u0431\u043B\u0430\u0447\u043D\u044B\u0439 Select Subject \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D \u0432 \u044D\u0442\u043E\u0439 \u0432\u0435\u0440\u0441\u0438\u0438 Photoshop.', en: 'Cloud Select Subject is not available in this Photoshop version.' };
     this.errFallbackFrame = { ru: '\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u0438\u0442\u044C \u043D\u0438\u0436\u043D\u0438\u0439 \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u044B\u0439 \u0441\u043B\u043E\u0439 \u0434\u043B\u044F fallback.', en: 'Cannot determine the bottom-most selected layer for fallback.' };
@@ -1272,10 +1275,6 @@ function Locale() {
 function finishSubjectGeometry(subject, layerBounds) {
     try {
         subject.layer = layerBounds;
-        subject.layer.center = {
-            y: Number(layerBounds.top) + Number(layerBounds.height) / 2,
-            x: Number(layerBounds.left) + Number(layerBounds.width) / 2
-        };
 
         // Both Python and autoCutout operate on a rasterized local view. Clamp
         // tiny detection overshoots to the actual restored layer bounds.
@@ -1290,17 +1289,7 @@ function finishSubjectGeometry(subject, layerBounds) {
         if (!isFiniteNumber(Number(subject.visualCenterX))) subject.visualCenterX = subject.center.x;
         if (subject.visualCenterX < subject.left) subject.visualCenterX = subject.left;
         if (subject.visualCenterX > subject.right) subject.visualCenterX = subject.right;
-        subject.vertical = subject.height > subject.width;
         subject.ratio = subject.width / subject.height;
-
-        subject.offset = {
-            top: subject.top - layerBounds.top,
-            left: subject.left - layerBounds.left,
-            bottom: layerBounds.bottom - subject.bottom,
-            right: layerBounds.right - subject.right,
-            width: layerBounds.width,
-            height: layerBounds.height
-        };
         return subject;
     } catch (e) {
         return null;
@@ -1857,9 +1846,8 @@ function AM(target, order) {
         d.putEnumerated(s2t('to'), s2t('ordinal'), s2t('none'));
         executeAction(s2t('set'), d, DialogModes.NO);
     }
-    this.autoCutout = function (sampleAllLayers) {
-        sampleAllLayers = sampleAllLayers == undefined ? false : true;
-        (d = new ActionDescriptor()).putBoolean(s2t('sampleAllLayers'), sampleAllLayers);
+    this.autoCutout = function () {
+        (d = new ActionDescriptor()).putBoolean(s2t('sampleAllLayers'), false);
         executeAction(s2t('autoCutout'), d, DialogModes.NO);
     }
     this.getSelectionMode = function () {
@@ -1880,80 +1868,38 @@ function AM(target, order) {
         (d = new ActionDescriptor()).putReference(s2t('null'), r);
         executeAction(s2t('groupEvent'), d, DialogModes.NO);
     }
-    this.transform = function (dX, dY, scale, x, y, subject, fake) {
-        if (!fake) {
-            (r = new ActionReference()).putEnumerated(s2t('layer'), s2t('ordinal'), s2t('targetEnum'));
-            (d = new ActionDescriptor()).putReference(s2t('null'), r);
-            d.putEnumerated(s2t('freeTransformCenterState'), s2t('quadCenterState'), s2t('QCSIndependent'));
-            ((d1 = new ActionDescriptor())).putUnitDouble(s2t('horizontal'), s2t('pixelsUnit'), x);
-            d1.putUnitDouble(s2t('vertical'), s2t('pixelsUnit'), y);
-            d.putObject(s2t('position'), s2t('paint'), d1);
-            (d2 = new ActionDescriptor()).putUnitDouble(s2t('horizontal'), s2t('pixelsUnit'), dX);
-            d2.putUnitDouble(s2t('vertical'), s2t('pixelsUnit'), dY);
-            d.putObject(s2t('offset'), s2t('offset'), d2);
-            d.putUnitDouble(s2t('width'), s2t('percentUnit'), scale);
-            d.putUnitDouble(s2t('height'), s2t('percentUnit'), scale);
-            d.putEnumerated(s2t('interfaceIconFrameDimmed'), s2t('interpolationType'), s2t('bicubic'));
-            if (!isFiniteNumber(dX) || !isFiniteNumber(dY) || !isFiniteNumber(scale) || !isFiniteNumber(x) || !isFiniteNumber(y) || scale <= 0) {
-                throw new Error('Invalid Transform geometry: offset=(' + dX + ', ' + dY + '), scale=' + scale + ', center=(' + x + ', ' + y + ')');
-            }
+    this.transform = function (dX, dY, scale, x, y) {
+        (r = new ActionReference()).putEnumerated(s2t('layer'), s2t('ordinal'), s2t('targetEnum'));
+        (d = new ActionDescriptor()).putReference(s2t('null'), r);
+        d.putEnumerated(s2t('freeTransformCenterState'), s2t('quadCenterState'), s2t('QCSIndependent'));
+        ((d1 = new ActionDescriptor())).putUnitDouble(s2t('horizontal'), s2t('pixelsUnit'), x);
+        d1.putUnitDouble(s2t('vertical'), s2t('pixelsUnit'), y);
+        d.putObject(s2t('position'), s2t('paint'), d1);
+        (d2 = new ActionDescriptor()).putUnitDouble(s2t('horizontal'), s2t('pixelsUnit'), dX);
+        d2.putUnitDouble(s2t('vertical'), s2t('pixelsUnit'), dY);
+        d.putObject(s2t('offset'), s2t('offset'), d2);
+        d.putUnitDouble(s2t('width'), s2t('percentUnit'), scale);
+        d.putUnitDouble(s2t('height'), s2t('percentUnit'), scale);
+        d.putEnumerated(s2t('interfaceIconFrameDimmed'), s2t('interpolationType'), s2t('bicubic'));
+        if (!isFiniteNumber(dX) || !isFiniteNumber(dY) || !isFiniteNumber(scale) || !isFiniteNumber(x) || !isFiniteNumber(y) || scale <= 0) {
+            throw new Error('Invalid Transform geometry: offset=(' + dX + ', ' + dY + '), scale=' + scale + ', center=(' + x + ', ' + y + ')');
+        }
+        try {
+            executeAction(s2t('transform'), d, DialogModes.NO);
+        } catch (transformError) {
+            var info = [];
+            try { info.push('layerID=' + lr.getProperty('layerID')); } catch (e0) { }
+            try { info.push('name=' + lr.getProperty('name')); } catch (e1) { }
+            try { info.push('group=' + lr.getProperty('group')); } catch (e2) { }
+            try { info.push('visible=' + lr.getProperty('visible')); } catch (e21) { }
             try {
-                executeAction(s2t('transform'), d, DialogModes.NO);
-            } catch (transformError) {
-                var info = [];
-                try { info.push('layerID=' + lr.getProperty('layerID')); } catch (e0) { }
-                try { info.push('name=' + lr.getProperty('name')); } catch (e1) { }
-                try { info.push('group=' + lr.getProperty('group')); } catch (e2) { }
-                try { info.push('visible=' + lr.getProperty('visible')); } catch (e21) { }
-                try {
-                    var tb = doc.descToObject(lr.getProperty('boundsNoEffects'));
-                    info.push('bounds=[' + tb.left + ',' + tb.top + ',' + tb.right + ',' + tb.bottom + ']');
-                } catch (e3) { }
-                info.push('offset=(' + dX + ',' + dY + ')');
-                info.push('scale=' + scale);
-                info.push('center=(' + x + ',' + y + ')');
-                throw new Error(transformError.message + '\nTransform context: ' + info.join('; '));
-            }
-        }
-        if (subject) {
-            with (subject) {
-                var dV = (height * scale / 100 - (bottom - top)),
-                    dH = (width * scale / 100 - (right - left));
-                top = top - (dV * (y - top) / height) + dY
-                bottom = bottom + (dV * (bottom - y) / height) + dY
-                left = left - (dH * (x - left) / width) + dX
-                right = right + (dH * (right - x) / width) + dX
-                center.x = left + (right - left) / 2
-                center.y = top + (bottom - top) / 2
-                height = height * scale / 100
-                width = width * scale / 100
-            }
-            with (subject.offset) {
-                top = top * scale / 100
-                left = left * scale / 100
-                bottom = bottom * scale / 100
-                right = right * scale / 100
-                height = height * scale / 100
-                width = width * scale / 100
-            }
-        }
-    }
-    this.move = function (dX, dY, subject, fake) {
-        if (!fake) {
-            (r = new ActionReference()).putEnumerated(s2t('layer'), s2t('ordinal'), s2t('targetEnum'));
-            (d = new ActionDescriptor()).putReference(s2t('null'), r);
-            (d1 = new ActionDescriptor()).putUnitDouble(s2t('horizontal'), s2t('pixelsUnit'), dX);
-            d1.putUnitDouble(s2t('vertical'), s2t('pixelsUnit'), dY);
-            d.putObject(s2t('to'), s2t('offset'), d1);
-            executeAction(s2t('move'), d, DialogModes.NO);
-        }
-        with (subject) {
-            center.x += dX
-            center.y += dY
-            top += dY
-            bottom += dY
-            left += dX
-            right += dX
+                var tb = doc.descToObject(lr.getProperty('boundsNoEffects'));
+                info.push('bounds=[' + tb.left + ',' + tb.top + ',' + tb.right + ',' + tb.bottom + ']');
+            } catch (e3) { }
+            info.push('offset=(' + dX + ',' + dY + ')');
+            info.push('scale=' + scale);
+            info.push('center=(' + x + ',' + y + ')');
+            throw new Error(transformError.message + '\nTransform context: ' + info.join('; '));
         }
     }
     this.makeSelection = function (id, mask) {
@@ -1982,13 +1928,12 @@ function AM(target, order) {
         (d = new ActionDescriptor()).putReference(s2t('null'), r);
         executeAction(s2t('delete'), d, DialogModes.NO);
     }
-    this.createPath = function (tolerance) {
-        tolerance = tolerance ? tolerance : 10;
+    this.createPath = function () {
         (r = new ActionReference()).putClass(s2t('path'));
         (d = new ActionDescriptor()).putReference(s2t('null'), r);
         (r1 = new ActionReference()).putProperty(s2t('selectionClass'), s2t('selection'));
         d.putReference(s2t('from'), r1);
-        d.putUnitDouble(s2t('tolerance'), s2t('pixelsUnit'), tolerance);
+        d.putUnitDouble(s2t('tolerance'), s2t('pixelsUnit'), 10);
         executeAction(s2t('make'), d, DialogModes.NO);
     }
     this.setLayerVisiblity = function (id, makeVisible) {
@@ -2034,7 +1979,6 @@ function getRuntimeInfo() {
     }
     var root = new Folder(local + '/' + RUNTIME_NAME);
     return {
-        root: root,
         pythonw: new File(root.fsName + '/venv/Scripts/pythonw.exe'),
         launcher: new File(root.fsName + '/launcher.vbs'),
         humanModel: new File(root.fsName + '/venv/models/human.onnx'),

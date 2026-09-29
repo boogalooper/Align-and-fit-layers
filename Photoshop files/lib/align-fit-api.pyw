@@ -10,7 +10,7 @@ API_HOST = "127.0.0.1"
 API_PORT_SEND = 6321       # Python -> JSX
 API_PORT_LISTEN = 6320     # JSX -> Python
 TIMEOUT = 15 * 60
-SERVER_VERSION = "0.4.4"
+SERVER_VERSION = "0.4.5"
 
 # Models are installed with the private runtime, outside the Photoshop folder.
 # sys.prefix points to the active venv when the server is started by launcher.vbs.
@@ -414,8 +414,12 @@ def match_group(subjects, frames, use_face_count=True):
     # portrait/landscape split: an opposite-orientation frame can win when it
     # gives the better real composition.
     if use_face_count:
+        # A subject that fell back to complete layer bounds has no reliable face
+        # count/object size. Exclude it from the people-count ranking instead of
+        # letting the artificial zero-face value distort the rest of the group.
+        ranked_subjects = [x for x in subjects if not bool(x.get("bounds_only", False))]
         s_rank = average_ranks(
-            subjects,
+            ranked_subjects,
             lambda x: (int(x.get("faces", 0)), float(x.get("bbox_area", 0.0))),
         )
         f_rank = average_ranks(frames, lambda x: float(x.get("area", 0.0)))
@@ -440,7 +444,9 @@ def match_group(subjects, frames, use_face_count=True):
                 placement_cost = abs(math.log(sr / fr)) * RATIO_WEIGHT
 
             size_cost = 0.0
-            if use_face_count:
+            if use_face_count and not bool(subject.get("bounds_only", False)):
+                # Per-layer Layer-bounds fallback is matched only by its supplied
+                # geometry cost. Face count/relative group size is unknown here.
                 size_cost = abs(s_rank[subject["id"]] - f_rank[frame["id"]]) * SIZE_WEIGHT
             row.append(placement_cost + size_cost)
         matrix.append(row)
@@ -453,7 +459,6 @@ def match_group(subjects, frames, use_face_count=True):
                 {
                     "subject_id": subjects[i]["id"],
                     "frame_id": frames[j]["id"],
-                    "cost": matrix[i][j],
                 }
             )
     return out
