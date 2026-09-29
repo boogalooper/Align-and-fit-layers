@@ -17,14 +17,14 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = 0.517,
+var SCRIPT_VERSION = 0.521,
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
     API_PORT_LISTEN = 6321,
     API_FILES = ['lib/align-fit-api.pyw', 'align-fit-api.pyw'],
     RUNTIME_NAME = 'AlignFitRuntime',
-    EXPECTED_SERVER_VERSION = '0.4.2',
+    EXPECTED_SERVER_VERSION = '0.4.3',
     PREVIEW_MAX = 1280,
     FINAL_BLEED_PX = 2,
     INIT_DELAY = 15000,
@@ -708,12 +708,18 @@ function matchFramesStage() {
     if (cfg.engine == 'python') {
         var matchSubjects = [], matchFrames = [];
         for (var i = 0; i < runCtx.subjects.length; i++) {
+            var placementCosts = {};
+            for (var pc = 0; pc < runCtx.frames.length; pc++) {
+                if (String(runCtx.frames[pc].color) != String(runCtx.subjects[i].color)) continue;
+                placementCosts[String(runCtx.frames[pc].id)] = objectPlacementCost(runCtx.subjects[i], runCtx.frames[pc]);
+            }
             matchSubjects.push({
                 id: runCtx.subjects[i].id,
                 color: runCtx.subjects[i].color,
                 ratio: runCtx.subjects[i].ratio,
                 faces: runCtx.subjects[i].faces ? runCtx.subjects[i].faces : 0,
-                bbox_area: runCtx.subjects[i].width * runCtx.subjects[i].height
+                bbox_area: runCtx.subjects[i].width * runCtx.subjects[i].height,
+                placement_costs: placementCosts
             });
         }
         for (var j = 0; j < runCtx.frames.length; j++) {
@@ -729,8 +735,14 @@ function matchFramesStage() {
         for (var mi = 0; mi < matched.assignments.length; mi++) {
             runCtx.assignments[String(matched.assignments[mi].subject_id)] = matched.assignments[mi].frame_id;
         }
-    } else {
+    } else if (cfg.engine == 'layer') {
+        // Layer-bounds mode has no detected object, so aspect ratio remains the
+        // meaningful matching criterion.
         runCtx.assignments = matchByRatio(runCtx.subjects, runCtx.frames);
+    } else {
+        // Device/Cloud have the same object geometry as the alignment stage, so
+        // match frames by the expected result of the real placement algorithm.
+        runCtx.assignments = matchByPlacement(runCtx.subjects, runCtx.frames);
     }
     validateAssignments(runCtx.assignments, runCtx.subjects);
 }
@@ -821,6 +833,35 @@ function undoPreviewHistory(sourceDoc) {
     app.activeDocument = sourceDoc;
     executeAction(charIDToTypeID('undo'), undefined, DialogModes.NO);
     app.activeDocument = sourceDoc;
+}
+
+function matchByPlacement(subjects, frames) {
+    var groups = {}, result = {};
+    for (var i = 0; i < subjects.length; i++) {
+        var sc = String(subjects[i].color);
+        if (!groups[sc]) groups[sc] = { subjects: [], frames: [] };
+        groups[sc].subjects.push(subjects[i]);
+    }
+    for (var j = 0; j < frames.length; j++) {
+        var fc = String(frames[j].color);
+        if (!groups[fc]) groups[fc] = { subjects: [], frames: [] };
+        groups[fc].frames.push(frames[j]);
+    }
+    for (var key in groups) {
+        var gs = groups[key].subjects, gf = groups[key].frames;
+        if (!gs.length || !gf.length) continue;
+        var matrix = [];
+        for (var si = 0; si < gs.length; si++) {
+            var row = [];
+            for (var fi = 0; fi < gf.length; fi++) row.push(objectPlacementCost(gs[si], gf[fi]));
+            matrix.push(row);
+        }
+        var assignment = hungarian(matrix);
+        for (var ai = 0; ai < assignment.length; ai++) {
+            if (assignment[ai] >= 0) result[String(gs[ai].id)] = gf[assignment[ai]].id;
+        }
+    }
+    return result;
 }
 
 function matchByRatio(subjects, frames) {
@@ -1413,75 +1454,267 @@ function alignLayerBounds(subject, frame) {
     lr.transform(dX, dY, scale, layer.center.x, layer.center.y);
 }
 
+function getObjectPlacementSolution(subject, frame) {
+    // Pure geometry shared by both matching and the final transform. Matching a
+    // photo to a frame therefore evaluates the same composition that will later
+    // be applied in Photoshop.
+    var layer = subject.layer,
+        layerW = Number(layer.width),
+        layerH = Number(layer.height),
+        subjectW = Number(subject.width),
+        subjectH = Number(subject.height),
+        frameW = Number(frame.width),
+        frameH = Number(frame.height);
+
+    if (!(layerW > 0) || !(layerH > 0) || !(subjectW > 0) || !(subjectH > 0) || !(frameW > 0) || !(frameH > 0)) return null;
+
+    var localLeft = Math.max(0, Number(subject.left) - Number(layer.left)),
+        localTop = Math.max(0, Number(subject.top) - Number(layer.top)),
+        localRight = Math.min(layerW, Number(subject.right) - Number(layer.left)),
+        localBottom = Math.min(layerH, Number(subject.bottom) - Number(layer.top)),
+        rightSpace = Math.max(0, layerW - localRight),
+        bottomSpace = Math.max(0, layerH - localBottom),
+        desiredTop = frameH * ((frame.vertical ? cfg.vTop : cfg.hTop) / 100),
+        desiredBottom = frameH * ((frame.vertical ? cfg.vBottom : cfg.hBottom) / 100),
+        desiredSide = frameW * ((frame.vertical ? cfg.vSide : cfg.hSide) / 100),
+        preferredBleed = FINAL_BLEED_PX > 0 ? FINAL_BLEED_PX : 0,
+        eps = 0.000001;
+
+    function clampValue(v, lo, hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    function solveFit(bleed) {
+        var side = desiredSide,
+            topMargin = desiredTop,
+            bottomMargin = desiredBottom,
+            innerW = frameW - side * 2,
+            innerH = frameH - topMargin - bottomMargin;
+        if (!(innerW > 0) || !(innerH > 0)) return null;
+
+        var sMax = Math.min(innerW / subjectW, innerH / subjectH);
+        if (!(sMax > 0)) return null;
+
+        var sMin = Math.max((frameW + bleed * 2) / layerW, (frameH + bleed * 2) / layerH),
+            need;
+
+        need = side + bleed;
+        if (need > 0) {
+            if (localLeft <= eps || rightSpace <= eps) return null;
+            sMin = Math.max(sMin, need / localLeft, need / rightSpace);
+        }
+        need = topMargin + bleed;
+        if (need > 0) {
+            if (localTop <= eps) return null;
+            sMin = Math.max(sMin, need / localTop);
+        }
+        need = bottomMargin + bleed;
+        if (need > 0) {
+            if (bottomSpace <= eps) return null;
+            sMin = Math.max(sMin, need / bottomSpace);
+        }
+        if (sMin > sMax + eps) return null;
+
+        var scale = sMax,
+            xLow = Math.max(
+                Number(frame.left) + side - scale * localLeft,
+                Number(frame.right) + bleed - scale * layerW
+            ),
+            xHigh = Math.min(
+                Number(frame.right) - side - scale * localRight,
+                Number(frame.left) - bleed
+            ),
+            yLow = Math.max(
+                Number(frame.top) + topMargin - scale * localTop,
+                Number(frame.bottom) + bleed - scale * layerH
+            ),
+            yHigh = Math.min(
+                Number(frame.bottom) - bottomMargin - scale * localBottom,
+                Number(frame.top) - bleed
+            );
+
+        if (xLow > xHigh + eps || yLow > yHigh + eps) return null;
+
+        var objectCenterLocalX = (localLeft + localRight) / 2,
+            objectCenterLocalY = (localTop + localBottom) / 2,
+            safeCenterY = Number(frame.top) + topMargin + innerH / 2,
+            preferredX = Number(frame.center.x) - scale * objectCenterLocalX,
+            preferredY = safeCenterY - scale * objectCenterLocalY;
+
+        return {
+            scale: scale,
+            tx: clampValue(preferredX, xLow, xHigh),
+            ty: clampValue(preferredY, yLow, yHigh),
+            oversized: false,
+            bleed: bleed,
+            desiredTop: desiredTop,
+            desiredBottom: desiredBottom,
+            desiredSide: desiredSide,
+            innerW: innerW,
+            innerH: innerH,
+            localLeft: localLeft,
+            localTop: localTop,
+            localRight: localRight,
+            localBottom: localBottom
+        };
+    }
+
+    function solveOversized(bleed) {
+        var anchorLocalX = (localLeft + localRight) / 2,
+            leftFromAnchor = anchorLocalX,
+            rightFromAnchor = layerW - anchorLocalX,
+            belowTopAnchor = layerH - localTop;
+
+        if (!(leftFromAnchor > eps) || !(rightFromAnchor > eps) || !(belowTopAnchor > eps)) return null;
+
+        var targetX = Number(frame.center.x),
+            scaleLR = Math.max(
+                (targetX - (Number(frame.left) - bleed)) / leftFromAnchor,
+                ((Number(frame.right) + bleed) - targetX) / rightFromAnchor
+            ),
+            scaleDesired = Math.max(
+                scaleLR,
+                (frameH + bleed - desiredTop) / belowTopAnchor
+            ),
+            topCoveredWithDesired = localTop > eps ?
+                (localTop * scaleDesired >= desiredTop + bleed - eps) :
+                (desiredTop <= eps && bleed <= eps),
+            scale,
+            topMargin;
+
+        if (topCoveredWithDesired) {
+            scale = scaleDesired;
+            topMargin = desiredTop;
+        } else {
+            if (localTop <= eps && bleed > 0) return null;
+            scale = Math.max(scaleLR, (frameH + bleed * 2) / layerH);
+            if (localTop > eps) scale = Math.max(scale, bleed / localTop);
+            topMargin = localTop * scale - bleed;
+            if (topMargin < 0) topMargin = 0;
+            if (topMargin > desiredTop) topMargin = desiredTop;
+        }
+
+        if (!(scale > 0)) return null;
+
+        var tx = targetX - scale * anchorLocalX,
+            ty = Number(frame.top) + topMargin - scale * localTop,
+            left = tx,
+            top = ty,
+            right = tx + scale * layerW,
+            bottom = ty + scale * layerH,
+            extra = 1;
+
+        if (left > Number(frame.left) - bleed + eps) {
+            extra = Math.max(extra, (targetX - (Number(frame.left) - bleed)) / (scale * leftFromAnchor));
+        }
+        if (right < Number(frame.right) + bleed - eps) {
+            extra = Math.max(extra, ((Number(frame.right) + bleed) - targetX) / (scale * rightFromAnchor));
+        }
+        if (bottom < Number(frame.bottom) + bleed - eps) {
+            extra = Math.max(extra, ((Number(frame.bottom) + bleed) - (Number(frame.top) + topMargin)) / (scale * belowTopAnchor));
+        }
+        if (top > Number(frame.top) - bleed + eps && localTop > eps) {
+            extra = Math.max(extra, (topMargin + bleed) / (scale * localTop));
+        }
+
+        if (extra > 1 + eps) {
+            scale *= extra;
+            tx = targetX - scale * anchorLocalX;
+            ty = Number(frame.top) + topMargin - scale * localTop;
+        }
+
+        return {
+            scale: scale,
+            tx: tx,
+            ty: ty,
+            oversized: true,
+            bleed: bleed,
+            topMargin: topMargin,
+            desiredTop: desiredTop,
+            desiredBottom: desiredBottom,
+            desiredSide: desiredSide,
+            innerW: Math.max(eps, frameW - desiredSide * 2),
+            innerH: Math.max(eps, frameH - desiredTop - desiredBottom),
+            localLeft: localLeft,
+            localTop: localTop,
+            localRight: localRight,
+            localBottom: localBottom
+        };
+    }
+
+    // The anti-seam bleed must never be the reason the subject is cropped.
+    var solution = solveFit(preferredBleed);
+    if (!solution && preferredBleed > 0) solution = solveFit(0);
+    if (!solution) {
+        solution = solveOversized(preferredBleed);
+        if (!solution && preferredBleed > 0) solution = solveOversized(0);
+    }
+    return solution;
+}
+
+function objectPlacementCost(subject, frame) {
+    // Lower is better. There is deliberately no hard portrait/landscape rule:
+    // a frame of the opposite orientation may win when the detected object fits
+    // it more naturally. The score measures the composition produced by the real
+    // placement solver, not the orientation of the source photograph.
+    var solution = getObjectPlacementSolution(subject, frame);
+    if (!solution) return 1000000;
+
+    var scale = Number(solution.scale),
+        frameW = Number(frame.width),
+        frameH = Number(frame.height),
+        objectW = Number(subject.width) * scale,
+        objectH = Number(subject.height) * scale,
+        innerW = Math.max(0.000001, Number(solution.innerW)),
+        innerH = Math.max(0.000001, Number(solution.innerH)),
+        ratioCost = Math.abs(Math.log((objectW / objectH) / (innerW / innerH))),
+        objectLeft = Number(solution.tx) + scale * Number(solution.localLeft),
+        objectTop = Number(solution.ty) + scale * Number(solution.localTop),
+        objectRight = Number(solution.tx) + scale * Number(solution.localRight),
+        objectBottom = Number(solution.ty) + scale * Number(solution.localBottom);
+
+    if (!solution.oversized) {
+        var preferredCenterX = Number(frame.center.x),
+            preferredCenterY = Number(frame.top) + Number(solution.desiredTop) + innerH / 2,
+            actualCenterX = (objectLeft + objectRight) / 2,
+            actualCenterY = (objectTop + objectBottom) / 2,
+            centerDx = Math.abs(actualCenterX - preferredCenterX) / Math.max(1, frameW),
+            centerDy = Math.abs(actualCenterY - preferredCenterY) / Math.max(1, frameH);
+
+        // Ratio describes how completely the object fills the usable rectangle;
+        // center shift penalizes pairs where insufficient image around the object
+        // would force the final composition away from the requested center.
+        return ratioCost * 4 + (centerDx + centerDy) * 8;
+    }
+
+    var ix1 = Math.max(Number(frame.left), objectLeft),
+        iy1 = Math.max(Number(frame.top), objectTop),
+        ix2 = Math.min(Number(frame.right), objectRight),
+        iy2 = Math.min(Number(frame.bottom), objectBottom),
+        visibleArea = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1),
+        objectArea = Math.max(0.000001, objectW * objectH),
+        cropFraction = 1 - Math.min(1, visibleArea / objectArea),
+        topLoss = Math.max(0, Number(solution.desiredTop) - Number(solution.topMargin || 0)) / Math.max(1, frameH);
+
+    // Oversized placement is normal and valid, but a centered full-object fit is
+    // preferred when quality is otherwise similar. Among oversized choices,
+    // prefer less object cropping and better preservation of the requested top gap.
+    return 2 + ratioCost * 4 + cropFraction * 8 + topLoss * 4;
+}
+
 function alignLayer(subject, frame) {
-    var dH = frame.center.x - subject.center.x,
-        dV = frame.center.y - subject.center.y,
-        border = subject.offset.right < subject.offset.left ? subject.offset.right : subject.offset.left,
-        scale = frame.width / (border * 2 + subject.width) * 100;
-    lr.transform(dH, dV, scale, subject.center.x, subject.center.y, subject, true)
-    if (subject.height > frame.height) {
-        var ratioTop = frame.height * ((frame.vertical ? cfg.vTop : cfg.hTop) / 100) * 0.5;
-        ratioTop = ratioTop < subject.offset.top ? ratioTop : subject.offset.top
-        lr.move(0, frame.top - subject.top + ratioTop, subject, true)
-    } else {
-        var ratioTop = frame.height * ((frame.vertical ? cfg.vTop : cfg.hTop) / 100),
-            ratioBottom = frame.height * ((frame.vertical ? cfg.vBottom : cfg.hBottom) / 100),
-            ratioWidth = frame.width * ((frame.vertical ? cfg.vSide : cfg.hSide) / 100)
-        ratioTop = ratioTop < subject.offset.top ? ratioTop : subject.offset.top
-        ratioBottom = ratioBottom > subject.offset.bottom ? subject.offset.bottom : ratioBottom
-        ratioWidth = ratioWidth > subject.offset.right ? subject.offset.right : ratioWidth
-        ratioWidth = ratioWidth > subject.offset.left ? subject.offset.left : ratioWidth
-        if (subject.height < frame.height) {
-            lr.transform(0, 0, (frame.bottom - subject.top) / ((subject.bottom + subject.offset.bottom) - subject.top) * 100, subject.center.x, subject.top, subject, true)
-            lr.transform(0, 0, (subject.bottom - frame.top) / (subject.bottom - subject.top + subject.offset.top) * 100, subject.center.x, subject.bottom, subject, true)
-            if (subject.height + ratioTop + ratioBottom < frame.height || subject.width + ratioWidth * 2 < frame.width) {
-                var scale = []
-                scale.push((frame.bottom - subject.center.y) / (subject.bottom + ratioBottom - subject.center.y) * 100)
-                scale.push((subject.center.y - frame.top) / (subject.center.y - (subject.top - ratioTop)) * 100)
-                scale.push((subject.center.x - frame.left) / (subject.center.x - (subject.left - ratioWidth)) * 100)
-                scale.push((frame.right - subject.center.x) / (subject.right + ratioWidth - subject.center.x) * 100)
-                scale.sort(function (a, b) { return a > b ? 1 : -1 })
-                if (scale[0] > 100) lr.transform(0, 0, scale[0], subject.center.x, subject.center.y, subject, true)
-            }
-        }
-        else {
-            lr.move(0, frame.top - subject.top + ratioTop, subject, true)
-            if (subject.bottom < frame.bottom) {
-                lr.transform(0, 0, (frame.bottom - subject.top) / (subject.bottom + ratioBottom - subject.top) * 100, frame.center.x, subject.top, subject, true)
-            }
-        }
-    }
-    if (!lr.getProperty('hasUserMask', false, frame.id) || !(lr.hasProperty('userMaskEnabled', frame.id) ? lr.getProperty('userMaskEnabled', false, frame.id) : false)) {
-        var visibleFrame = doc.descToObject(lr.getProperty('boundsNoEffects', false, frame.id)),
-            scale = [];
-        with (subject) {
-            if (visibleFrame.bottom > bottom + offset.bottom || visibleFrame.top < top - offset.top || visibleFrame.right > right + offset.right || visibleFrame.left < left - offset.left) {
-                scale.push((visibleFrame.bottom - frame.center.y) / (bottom + offset.bottom - frame.center.y) * 100)
-                scale.push((frame.center.y - visibleFrame.top) / (frame.center.y - (top - offset.top)) * 100)
-                scale.push((visibleFrame.right - frame.center.x) / (right + offset.right - frame.center.x) * 100)
-                scale.push((frame.center.x - visibleFrame.left) / (frame.center.x - (left - offset.left)) * 100)
-                if (scale.length) {
-                    scale.sort(function (a, b) { return a < b ? 1 : -1 })
-                    lr.transform(0, 0, scale[0], frame.center.x, frame.center.y, subject, true)
-                }
-            }
-        }
-    }
-    with (subject) {
-        top -= offset.top
-        left -= offset.left
-        right += offset.right
-        bottom += offset.bottom
-        center = { y: top + (bottom - top) / 2, x: left + (right - left) / 2 }
-        var targetW = right - left,
-            targetH = bottom - top,
-            bleed = FINAL_BLEED_PX,
-            bleedFactor = 1;
-        if (targetW > 0 && targetH > 0 && bleed > 0) {
-            bleedFactor = Math.max((targetW + bleed * 2) / targetW, (targetH + bleed * 2) / targetH);
-        }
-        lr.transform(center.x - layer.center.x, center.y - layer.center.y, (targetW / layer.width) * 100 * bleedFactor, layer.center.x, layer.center.y)
-    }
+    var solution = getObjectPlacementSolution(subject, frame);
+    if (!solution) throw new Error('Invalid object/frame geometry.');
+
+    var layer = subject.layer,
+        layerW = Number(layer.width),
+        layerH = Number(layer.height),
+        targetLayerCenterX = solution.tx + solution.scale * layerW / 2,
+        targetLayerCenterY = solution.ty + solution.scale * layerH / 2,
+        dX = targetLayerCenterX - Number(layer.center.x),
+        dY = targetLayerCenterY - Number(layer.center.y);
+
+    lr.transform(dX, dY, solution.scale * 100, Number(layer.center.x), Number(layer.center.y));
 }
 function AM(target, order) {
     var s2t = stringIDToTypeID,

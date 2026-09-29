@@ -10,7 +10,7 @@ API_HOST = "127.0.0.1"
 API_PORT_SEND = 6321       # Python -> JSX
 API_PORT_LISTEN = 6320     # JSX -> Python
 TIMEOUT = 15 * 60
-SERVER_VERSION = "0.4.2"
+SERVER_VERSION = "0.4.3"
 
 # Models are installed with the private runtime, outside the Photoshop folder.
 # sys.prefix points to the active venv when the server is started by launcher.vbs.
@@ -23,10 +23,12 @@ FACE_NMS = 0.30
 MASK_MIN_COMPONENT_FRAC = 0.00010
 MASK_MAX_COVERAGE = 0.92
 
-# Aspect ratio is deliberately much more important than size ranking.
+# Frame matching primarily uses the placement score calculated by JSX with
+# the same geometry that will be applied in Photoshop. Face-count/area ranking
+# is deliberately secondary. Ratio-only matching remains a compatibility
+# fallback for malformed/older requests.
 RATIO_WEIGHT = 12.0
 SIZE_WEIGHT = 0.75
-ORIENTATION_PENALTY = 4.0
 
 last_request_time = time.time()
 active_requests = 0
@@ -347,9 +349,10 @@ def match_group(subjects, frames, use_face_count=True):
     if not subjects or not frames:
         return []
 
-    # Aspect ratio is always the primary criterion. The optional face-count
-    # criterion ranks group photos against frame area; bbox area only resolves
-    # ties between photos with the same detected face count.
+    # The primary cost comes from JSX, which evaluates the exact object-placement
+    # geometry for each photo/frame pair. There is intentionally no hard
+    # portrait/landscape split: an opposite-orientation frame can win when it
+    # gives the better real composition.
     if use_face_count:
         s_rank = average_ranks(
             subjects,
@@ -363,17 +366,23 @@ def match_group(subjects, frames, use_face_count=True):
     matrix = []
     for subject in subjects:
         row = []
+        placement_costs = subject.get("placement_costs") or {}
         sr = max(1e-6, float(subject.get("ratio", 1.0)))
-        s_vertical = sr < 1.0
         for frame in frames:
-            fr = max(1e-6, float(frame.get("ratio", 1.0)))
-            f_vertical = fr < 1.0
-            ratio_cost = abs(math.log(sr / fr)) * RATIO_WEIGHT
+            raw_cost = placement_costs.get(str(frame.get("id")))
+            try:
+                placement_cost = float(raw_cost)
+                if not math.isfinite(placement_cost) or placement_cost < 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                # Compatibility fallback. New JSX always supplies placement_costs.
+                fr = max(1e-6, float(frame.get("ratio", 1.0)))
+                placement_cost = abs(math.log(sr / fr)) * RATIO_WEIGHT
+
             size_cost = 0.0
             if use_face_count:
                 size_cost = abs(s_rank[subject["id"]] - f_rank[frame["id"]]) * SIZE_WEIGHT
-            orientation_cost = ORIENTATION_PENALTY if s_vertical != f_vertical else 0.0
-            row.append(ratio_cost + size_cost + orientation_cost)
+            row.append(placement_cost + size_cost)
         matrix.append(row)
 
     assignment = hungarian(matrix)
