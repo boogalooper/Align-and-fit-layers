@@ -17,7 +17,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.5.31',
+var SCRIPT_VERSION = '0.5.32',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
@@ -1484,8 +1484,11 @@ function getObjectPlacementSolution(subject, frame) {
         // the top-anchored composition even if the rectangular bbox could be
         // mathematically fitted inside the frame. A small relative tolerance also
         // absorbs preview scaling / segmentation rounding.
-        edgeTolerance = Math.max(2, layerH * 0.0025),
-        croppedAtBottom = bottomSpace <= edgeTolerance;
+        edgeToleranceX = Math.max(2, layerW * 0.0025),
+        edgeToleranceY = Math.max(2, layerH * 0.0025),
+        croppedAtLeft = localLeft <= edgeToleranceX,
+        croppedAtRight = rightSpace <= edgeToleranceX,
+        croppedAtBottom = bottomSpace <= edgeToleranceY;
 
     visualCenterLocalX = Math.max(localLeft, Math.min(localRight, visualCenterLocalX));
 
@@ -1501,116 +1504,192 @@ function getObjectPlacementSolution(subject, frame) {
             innerH = frameH - topMargin - bottomMargin;
         if (!(innerW > 0) || !(innerH > 0)) return null;
 
-        // Requested margins define the preferred composition, but they must not
-        // turn an otherwise valid full-object placement into an oversized crop.
-        // First choose the largest scale that respects the requested working
-        // area. If the photo itself cannot cover the frame at that composition,
-        // margins may relax while keeping the COMPLETE detected object visible.
+        // Requested margins define the preferred scale. Side margins are softer
+        // than keeping the complete object visible and centered: if the photo
+        // needs a little more scale to cover the frame while the object can still
+        // remain centered, increase the scale instead of shifting the object.
         var halfInnerW = innerW / 2,
             visualLeft = visualCenterLocalX - localLeft,
             visualRight = localRight - visualCenterLocalX,
             sDesiredX = Number.POSITIVE_INFINITY,
             sDesiredY = innerH / subjectH,
             sDesired;
-        if (visualLeft > eps) sDesiredX = Math.min(sDesiredX, halfInnerW / visualLeft);
-        if (visualRight > eps) sDesiredX = Math.min(sDesiredX, halfInnerW / visualRight);
+        // A side that coincides with the source-image edge is an open/cropped
+        // object boundary, not a real end of the person/group. Do not use that
+        // side to limit scale or to pull the visual center toward the frame edge.
+        if (!croppedAtLeft && visualLeft > eps) sDesiredX = Math.min(sDesiredX, halfInnerW / visualLeft);
+        if (!croppedAtRight && visualRight > eps) sDesiredX = Math.min(sDesiredX, halfInnerW / visualRight);
         if (!isFiniteNumber(sDesiredX)) sDesiredX = innerW / subjectW;
         sDesired = Math.min(sDesiredX, sDesiredY);
         if (!(sDesired > 0)) return null;
 
-        // Hard feasibility interval: the layer must cover the frame and the
-        // whole object must remain visible. No requested margin is treated as a
-        // hard requirement here. This is what prevents a full-length portrait
-        // from falling into the oversized branch merely because, for example,
-        // there are too few source pixels below the feet to keep the requested
-        // bottom gap while also covering the frame.
+        // Free-placement feasibility: the layer must cover the frame and the
+        // complete detected object must remain inside it. These bounds say that
+        // some translation exists; centered placement is tested separately below.
         var sMinHard = Math.max(
                 (frameW + bleed * 2) / layerW,
                 (frameH + bleed * 2) / layerH
             ),
-            sMaxHard = Math.min(frameW / subjectW, frameH / subjectH);
+            sMaxXHard = (!croppedAtLeft && !croppedAtRight) ? frameW / subjectW : Number.POSITIVE_INFINITY,
+            sMaxHard = Math.min(sMaxXHard, frameH / subjectH);
 
         if (bleed > 0) {
-            if (localLeft <= eps || rightSpace <= eps || localTop <= eps || bottomSpace <= eps) return null;
-            sMinHard = Math.max(
-                sMinHard,
-                bleed / localLeft,
-                bleed / rightSpace,
-                bleed / localTop,
-                bleed / bottomSpace
-            );
+            if ((!croppedAtLeft && localLeft <= eps) ||
+                (!croppedAtRight && rightSpace <= eps) ||
+                localTop <= eps || bottomSpace <= eps) return null;
+            if (!croppedAtLeft) sMinHard = Math.max(sMinHard, bleed / localLeft);
+            if (!croppedAtRight) sMinHard = Math.max(sMinHard, bleed / rightSpace);
+            sMinHard = Math.max(sMinHard, bleed / localTop, bleed / bottomSpace);
         }
         if (sMinHard > sMaxHard + eps) return null;
 
-        // Stop at the first requested object limit (vertical or horizontal).
-        // Increase only if the layer itself would otherwise fail to cover the
-        // frame. As long as sMinHard <= sMaxHard the object remains complete.
-        var scale = Math.max(sDesired, sMinHard);
-        if (scale > sMaxHard) scale = sMaxHard;
-
-        var hardXLow = Math.max(
-                Number(frame.left) - scale * localLeft,
-                Number(frame.right) + bleed - scale * layerW
-            ),
-            hardXHigh = Math.min(
-                Number(frame.right) - scale * localRight,
-                Number(frame.left) - bleed
-            ),
-            hardYLow = Math.max(
-                Number(frame.top) - scale * localTop,
-                Number(frame.bottom) + bleed - scale * layerH
-            ),
-            hardYHigh = Math.min(
-                Number(frame.bottom) - scale * localBottom,
-                Number(frame.top) - bleed
-            );
-
-        if (hardXLow > hardXHigh + eps || hardYLow > hardYHigh + eps) return null;
-
         var objectCenterLocalY = (localTop + localBottom) / 2,
-            safeCenterY = Number(frame.top) + topMargin + innerH / 2,
-            preferredX = Number(frame.center.x) - scale * visualCenterLocalX,
-            preferredY = safeCenterY - scale * objectCenterLocalY,
-            desiredYLow = Math.max(hardYLow, Number(frame.top) + topMargin - scale * localTop),
-            desiredYHigh = Math.min(hardYHigh, Number(frame.bottom) - bottomMargin - scale * localBottom),
-            tx,
-            ty;
+            targetX = Number(frame.center.x),
+            targetY = Number(frame.top) + topMargin + innerH / 2,
+            leftLayerSpan = visualCenterLocalX,
+            rightLayerSpan = layerW - visualCenterLocalX,
+            topLayerSpan = objectCenterLocalY,
+            bottomLayerSpan = layerH - objectCenterLocalY,
+            leftObjectSpan = visualCenterLocalX - localLeft,
+            rightObjectSpan = localRight - visualCenterLocalX,
+            topObjectSpan = objectCenterLocalY - localTop,
+            bottomObjectSpan = localBottom - objectCenterLocalY,
+            inf = Number.POSITIVE_INFINITY;
 
-        // Horizontal visual centering has priority over the requested side gap.
-        // The side value influences the preferred SCALE, but must not move the
-        // person/group away from the frame center merely to hit that gap. Only
-        // the hard requirements (full object + layer cover) may force a shift.
-        tx = clampValue(preferredX, hardXLow, hardXHigh);
-
-        if (desiredYLow <= desiredYHigh + eps) {
-            ty = clampValue(preferredY, desiredYLow, desiredYHigh);
-        } else {
-            // Top and bottom margins are both compositionally important. If the
-            // requested pair cannot be kept exactly while the whole object and
-            // the frame coverage are preserved, relax them together around the
-            // preferred vertical center instead of sacrificing one for the other.
-            // The hard interval is used only to prevent empty areas outside the
-            // photo or cropping of an otherwise fully placeable object.
-            ty = clampValue(preferredY, hardYLow, hardYHigh);
+        function coverMin(target, frameLow, frameHigh, beforeSpan, afterSpan) {
+            var m = 0;
+            if (beforeSpan > eps) m = Math.max(m, (target - (frameLow - bleed)) / beforeSpan);
+            else if (target > frameLow - bleed + eps) return inf;
+            if (afterSpan > eps) m = Math.max(m, ((frameHigh + bleed) - target) / afterSpan);
+            else if (target < frameHigh + bleed - eps) return inf;
+            return Math.max(0, m);
         }
 
-        return {
-            scale: scale,
-            tx: tx,
-            ty: ty,
-            oversized: false,
-            bleed: bleed,
-            desiredTop: desiredTop,
-            desiredBottom: desiredBottom,
-            desiredSide: desiredSide,
-            innerW: innerW,
-            innerH: innerH,
-            localLeft: localLeft,
-            localTop: localTop,
-            localRight: localRight,
-            localBottom: localBottom,
-            visualCenterLocalX: visualCenterLocalX
-        };
+        function containMax(target, frameLow, frameHigh, beforeSpan, afterSpan) {
+            var m = inf;
+            if (beforeSpan > eps) m = Math.min(m, (target - frameLow) / beforeSpan);
+            else if (target < frameLow - eps) return -1;
+            if (afterSpan > eps) m = Math.min(m, (frameHigh - target) / afterSpan);
+            else if (target > frameHigh + eps) return -1;
+            return m;
+        }
+
+        var xCenterMin = coverMin(targetX, Number(frame.left), Number(frame.right), leftLayerSpan, rightLayerSpan),
+            xCenterMax = inf,
+            yCenterMin = coverMin(targetY, Number(frame.top), Number(frame.bottom), topLayerSpan, bottomLayerSpan),
+            yCenterMax = containMax(targetY, Number(frame.top), Number(frame.bottom), topObjectSpan, bottomObjectSpan);
+        if (!croppedAtLeft && leftObjectSpan > eps) xCenterMax = Math.min(xCenterMax, (targetX - Number(frame.left)) / leftObjectSpan);
+        if (!croppedAtRight && rightObjectSpan > eps) xCenterMax = Math.min(xCenterMax, (Number(frame.right) - targetX) / rightObjectSpan);
+
+        function hardIntervals(scale) {
+            return {
+                xLow: Math.max(
+                    croppedAtLeft ? -inf : Number(frame.left) - scale * localLeft,
+                    Number(frame.right) + bleed - scale * layerW
+                ),
+                xHigh: Math.min(
+                    croppedAtRight ? inf : Number(frame.right) - scale * localRight,
+                    Number(frame.left) - bleed
+                ),
+                yLow: Math.max(
+                    Number(frame.top) - scale * localTop,
+                    Number(frame.bottom) + bleed - scale * layerH
+                ),
+                yHigh: Math.min(
+                    Number(frame.bottom) - scale * localBottom,
+                    Number(frame.top) - bleed
+                )
+            };
+        }
+
+        function makeResult(scale, tx, ty) {
+            return {
+                scale: scale,
+                tx: tx,
+                ty: ty,
+                oversized: false,
+                bleed: bleed,
+                desiredTop: desiredTop,
+                desiredBottom: desiredBottom,
+                desiredSide: desiredSide,
+                innerW: innerW,
+                innerH: innerH,
+                localLeft: localLeft,
+                localTop: localTop,
+                localRight: localRight,
+                localBottom: localBottom,
+                visualCenterLocalX: visualCenterLocalX,
+                croppedAtLeft: croppedAtLeft,
+                croppedAtRight: croppedAtRight
+            };
+        }
+
+        // Best case: preserve both requested centers exactly. If the preferred
+        // scale is too small for the layer to cover the frame, enlarge only as
+        // much as necessary, provided the complete object still fits.
+        var centeredMin = Math.max(sMinHard, xCenterMin, yCenterMin),
+            centeredMax = Math.min(sMaxHard, xCenterMax, yCenterMax),
+            scale, h, preferredX, preferredY, desiredYLow, desiredYHigh, tx, ty;
+        if (centeredMin <= centeredMax + eps) {
+            scale = Math.max(sDesired, centeredMin);
+            if (scale <= centeredMax + eps) {
+                return makeResult(
+                    scale,
+                    targetX - scale * visualCenterLocalX,
+                    targetY - scale * objectCenterLocalY
+                );
+            }
+        }
+
+        // Horizontal visual centering is the strongest positional rule. Even if
+        // exact vertical centering is impossible, try every admissible scale that
+        // keeps the complete object visible before allowing an X shift.
+        var xOnlyMin = Math.max(sMinHard, xCenterMin),
+            xOnlyMax = Math.min(sMaxHard, xCenterMax);
+        if (xOnlyMin <= xOnlyMax + eps) {
+            scale = Math.max(sDesired, xOnlyMin);
+            if (scale > xOnlyMax) scale = xOnlyMax;
+            h = hardIntervals(scale);
+            if (h.xLow <= h.xHigh + eps && h.yLow <= h.yHigh + eps) {
+                preferredY = targetY - scale * objectCenterLocalY;
+                desiredYLow = Math.max(h.yLow, Number(frame.top) + topMargin - scale * localTop);
+                desiredYHigh = Math.min(h.yHigh, Number(frame.bottom) - bottomMargin - scale * localBottom);
+                if (desiredYLow <= desiredYHigh + eps) ty = clampValue(preferredY, desiredYLow, desiredYHigh);
+                else ty = clampValue(preferredY, h.yLow, h.yHigh);
+                return makeResult(scale, targetX - scale * visualCenterLocalX, ty);
+            }
+        }
+
+        // If exact X centering is genuinely impossible, preserve the preferred
+        // vertical center when that can still be done with the complete object.
+        var yOnlyMin = Math.max(sMinHard, yCenterMin),
+            yOnlyMax = Math.min(sMaxHard, yCenterMax);
+        if (yOnlyMin <= yOnlyMax + eps) {
+            scale = Math.max(sDesired, yOnlyMin);
+            if (scale > yOnlyMax) scale = yOnlyMax;
+            h = hardIntervals(scale);
+            if (h.xLow <= h.xHigh + eps && h.yLow <= h.yHigh + eps) {
+                preferredX = targetX - scale * visualCenterLocalX;
+                return makeResult(scale, clampValue(preferredX, h.xLow, h.xHigh), targetY - scale * objectCenterLocalY);
+            }
+        }
+
+        // Last resort for a still fully visible object: use the preferred scale
+        // plus only the minimum translation required by layer coverage. This path
+        // is reached only when no scale can keep either preferred center exactly.
+        scale = Math.max(sDesired, sMinHard);
+        if (scale > sMaxHard) scale = sMaxHard;
+        h = hardIntervals(scale);
+        if (h.xLow > h.xHigh + eps || h.yLow > h.yHigh + eps) return null;
+
+        preferredX = targetX - scale * visualCenterLocalX;
+        preferredY = targetY - scale * objectCenterLocalY;
+        desiredYLow = Math.max(h.yLow, Number(frame.top) + topMargin - scale * localTop);
+        desiredYHigh = Math.min(h.yHigh, Number(frame.bottom) - bottomMargin - scale * localBottom);
+        tx = clampValue(preferredX, h.xLow, h.xHigh);
+        if (desiredYLow <= desiredYHigh + eps) ty = clampValue(preferredY, desiredYLow, desiredYHigh);
+        else ty = clampValue(preferredY, h.yLow, h.yHigh);
+        return makeResult(scale, tx, ty);
     }
 
     function solveOversized(bleed) {
@@ -1709,7 +1788,9 @@ function getObjectPlacementSolution(subject, frame) {
             localTop: localTop,
             localRight: localRight,
             localBottom: localBottom,
-            visualCenterLocalX: visualCenterLocalX
+            visualCenterLocalX: visualCenterLocalX,
+            croppedAtLeft: croppedAtLeft,
+            croppedAtRight: croppedAtRight
         };
     }
 
@@ -1718,10 +1799,34 @@ function getObjectPlacementSolution(subject, frame) {
     // do not use the full-object centering branch: the bbox is open at the bottom
     // and would create an artificial large top gap. In that case use the same
     // top anchor as for a genuinely oversized object.
+    function chooseFitSolution(a, b) {
+        if (!a) return b;
+        if (!b) return a;
+        var anchorY = (localTop + localBottom) / 2,
+            targetY = Number(frame.top) + desiredTop + (frameH - desiredTop - desiredBottom) / 2,
+            ax = Number(a.tx) + Number(a.scale) * visualCenterLocalX,
+            bx = Number(b.tx) + Number(b.scale) * visualCenterLocalX,
+            ay = Number(a.ty) + Number(a.scale) * anchorY,
+            by = Number(b.ty) + Number(b.scale) * anchorY,
+            dxA = Math.abs(ax - Number(frame.center.x)),
+            dxB = Math.abs(bx - Number(frame.center.x)),
+            dyA = Math.abs(ay - targetY),
+            dyB = Math.abs(by - targetY),
+            centerTol = 0.0001;
+
+        // A two-pixel anti-seam bleed is lower priority than the actual subject
+        // composition. Prefer the solution that keeps the visual center exact;
+        // only when centering is equivalent do we keep the bleed.
+        if (Math.abs(dxA - dxB) > centerTol) return dxA < dxB ? a : b;
+        if (Math.abs(dyA - dyB) > centerTol) return dyA < dyB ? a : b;
+        return Number(a.bleed) >= Number(b.bleed) ? a : b;
+    }
+
     var solution = null;
     if (!croppedAtBottom) {
-        solution = solveFit(preferredBleed);
-        if (!solution && preferredBleed > 0) solution = solveFit(0);
+        var fitWithBleed = solveFit(preferredBleed),
+            fitWithoutBleed = preferredBleed > 0 ? solveFit(0) : null;
+        solution = chooseFitSolution(fitWithBleed, fitWithoutBleed);
     }
     if (!solution) {
         solution = solveOversized(preferredBleed);
