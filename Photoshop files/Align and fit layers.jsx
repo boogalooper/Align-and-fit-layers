@@ -2226,7 +2226,7 @@ function getRuntimeInfo() {
     if (!local) {
         try { local = Folder.userData.parent.fsName + '/Local'; } catch (e) { local = ''; }
     }
-    var root = new Folder(local + '/' + RUNTIME_NAME);
+    var root = new Folder(local + '/JazzyScripts/' + RUNTIME_NAME);
     return {
         pythonw: new File(root.fsName + '/venv/Scripts/pythonw.exe'),
         launcher: new File(root.fsName + '/launcher.vbs'),

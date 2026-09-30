@@ -2,8 +2,8 @@
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 
-set "INSTALLER_VERSION=10"
-set "RUNTIME=%LOCALAPPDATA%\AlignFitRuntime"
+set "INSTALLER_VERSION=11"
+set "RUNTIME=%LOCALAPPDATA%\JazzyScripts\AlignFitRuntime"
 set "UV_DIR=%RUNTIME%\uv"
 set "UV_STAGE=%RUNTIME%\uv.new"
 set "UV=%UV_DIR%\uv.exe"
@@ -382,7 +382,7 @@ del /f /q "%LAUNCHER_TMP%" >nul 2>&1
 >>"%LAUNCHER_TMP%" echo Dim sh, fso, root, py, server, cmd
 >>"%LAUNCHER_TMP%" echo Set sh = CreateObject("WScript.Shell")
 >>"%LAUNCHER_TMP%" echo Set fso = CreateObject("Scripting.FileSystemObject")
->>"%LAUNCHER_TMP%" echo root = sh.ExpandEnvironmentStrings("%%LOCALAPPDATA%%") ^& "\AlignFitRuntime"
+>>"%LAUNCHER_TMP%" echo root = sh.ExpandEnvironmentStrings("%%LOCALAPPDATA%%") ^& "\JazzyScripts\AlignFitRuntime"
 >>"%LAUNCHER_TMP%" echo py = root ^& "\venv\Scripts\pythonw.exe"
 >>"%LAUNCHER_TMP%" echo server = sh.Environment("PROCESS")("ALIGN_FIT_SERVER")
 >>"%LAUNCHER_TMP%" echo If Len(server) = 0 Then WScript.Quit 2

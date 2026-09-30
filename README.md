@@ -274,7 +274,7 @@ Photoshop определяет объект с помощью облачной �
 
 Если дополнительный модуль Python больше не нужен, после закрытия Photoshop можно удалить папку:
 
-`%LOCALAPPDATA%\AlignFitRuntime`
+`%LOCALAPPDATA%\JazzyScripts\AlignFitRuntime`
 
 
 ### Плавный прогресс Python-анализа
