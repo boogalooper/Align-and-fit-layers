@@ -10,7 +10,7 @@ API_HOST = "127.0.0.1"
 API_PORT_SEND = 6321       # Python -> JSX
 API_PORT_LISTEN = 6320     # JSX -> Python
 TIMEOUT = 15 * 60
-SERVER_VERSION = "0.4.5"
+SERVER_VERSION = "0.4.6"
 
 # Models are installed with the private runtime, outside the Photoshop folder.
 # sys.prefix points to the active venv when the server is started by launcher.vbs.
@@ -170,42 +170,175 @@ def clamp_bbox(box, w, h):
     return [x1, y1, x2, y2]
 
 
-def human_geometry_from_mask(mask, np, cv2):
-    """Return the retained human envelope and its foreground center of mass on X."""
+def _median(values):
+    values = sorted(float(v) for v in values)
+    n = len(values)
+    if not n:
+        return None
+    m = n // 2
+    return values[m] if n % 2 else (values[m - 1] + values[m]) * 0.5
+
+
+def _bbox_gap(a, b):
+    """Euclidean gap between two axis-aligned boxes; zero when they overlap."""
+    dx = max(float(a[0]) - float(b[2]), float(b[0]) - float(a[2]), 0.0)
+    dy = max(float(a[1]) - float(b[3]), float(b[1]) - float(a[3]), 0.0)
+    return math.hypot(dx, dy)
+
+
+def _human_components(mask, np, cv2):
+    """Return retained connected human-mask components with geometry metadata."""
     h, w = mask.shape[:2]
     binary = (mask > 0).astype(np.uint8)
     foreground = int(binary.sum())
     if foreground <= 0:
-        return None, None
+        return []
+    if float(foreground) / float(max(1, w * h)) > MASK_MAX_COVERAGE:
+        return []
 
     num, _labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
     min_area = max(20, int(round(w * h * MASK_MIN_COMPONENT_FRAC)))
-    kept = []
-    kept_area = 0.0
-    weighted_x = 0.0
+    out = []
     for i in range(1, num):
         x, y, cw, ch, area = [int(v) for v in stats[i]]
         if area < min_area or cw < 3 or ch < 3:
             continue
-        kept.append([float(x), float(y), float(x + cw), float(y + ch)])
-        kept_area += float(area)
-        weighted_x += float(centroids[i][0]) * float(area)
+        out.append({
+            "bbox": [float(x), float(y), float(x + cw), float(y + ch)],
+            "area": float(area),
+            "center_x": float(centroids[i][0]),
+            "center_y": float(centroids[i][1]),
+        })
+    return out
 
-    if not kept:
-        return None, None
-    if float(foreground) / float(max(1, w * h)) > MASK_MAX_COVERAGE:
-        return None, None
+
+def _associate_face(face, components):
+    """Associate a face with the nearest plausible human component."""
+    if not components:
+        return None
+    fx1, fy1, fx2, fy2 = [float(v) for v in face]
+    fw = max(1.0, fx2 - fx1)
+    fh = max(1.0, fy2 - fy1)
+    cx = (fx1 + fx2) * 0.5
+    cy = (fy1 + fy2) * 0.5
+    best = None
+    best_score = None
+    for i, comp in enumerate(components):
+        x1, y1, x2, y2 = comp["bbox"]
+        # Segmentation can trim hair/head edges, so allow a face-sized halo.
+        pad_x = max(6.0, fw * 0.75, (x2 - x1) * 0.05)
+        pad_y = max(6.0, fh * 1.00, (y2 - y1) * 0.05)
+        if not (x1 - pad_x <= cx <= x2 + pad_x and y1 - pad_y <= cy <= y2 + pad_y):
+            continue
+        ccx = (x1 + x2) * 0.5
+        ccy = (y1 + y2) * 0.5
+        score = ((cx - ccx) / max(1.0, x2 - x1)) ** 2 + ((cy - ccy) / max(1.0, y2 - y1)) ** 2
+        if best_score is None or score < best_score:
+            best = i
+            best_score = score
+    return best
+
+
+def _filter_main_group(components, face_boxes, image_w, image_h):
+    """Conservatively remove obvious small/detached background people.
+
+    The filter is intentionally cautious: comparable-size people are always kept.
+    Only components that are both small relative to the main group and spatially
+    detached are candidates for removal. Face size provides a second depth cue.
+    """
+    if not components:
+        return [], []
+    if len(components) == 1 and not face_boxes:
+        return components, []
+
+    largest_area = max(c["area"] for c in components)
+    face_info = []
+    for face in face_boxes or []:
+        fx1, fy1, fx2, fy2 = [float(v) for v in face]
+        fh = max(1.0, fy2 - fy1)
+        face_info.append({"box": [fx1, fy1, fx2, fy2], "height": fh, "component": _associate_face(face, components)})
+
+    # Use the upper half of detected face sizes as a robust foreground scale.
+    heights = sorted((f["height"] for f in face_info), reverse=True)
+    upper = heights[:max(1, (len(heights) + 1) // 2)] if heights else []
+    face_ref = _median(upper)
+    main_face_min = (face_ref * 0.45) if face_ref else None
+
+    core = set()
+    largest_idx = max(range(len(components)), key=lambda i: components[i]["area"])
+    core.add(largest_idx)
+    for i, comp in enumerate(components):
+        if comp["area"] >= largest_area * 0.15:
+            core.add(i)
+    if main_face_min is not None:
+        for f in face_info:
+            if f["component"] is not None and f["height"] >= main_face_min:
+                core.add(f["component"])
+
+    core_bbox = union_boxes([components[i]["bbox"] for i in sorted(core)])
+    near_gap = max(12.0, max(float(image_w), float(image_h)) * 0.035)
+    kept = set(core)
+    for i, comp in enumerate(components):
+        if i in kept:
+            continue
+        # Keep modest-size neighbours so a missed face in the main group does not
+        # accidentally remove a real person standing close to the others.
+        if comp["area"] >= largest_area * 0.04 and _bbox_gap(comp["bbox"], core_bbox) <= near_gap:
+            kept.add(i)
+
+    kept_components = [components[i] for i in sorted(kept)]
+    kept_bbox = union_boxes([c["bbox"] for c in kept_components])
+
+    filtered_faces = []
+    for f in face_info:
+        idx = f["component"]
+        if idx is None or idx not in kept:
+            continue
+        # Tiny faces are the strongest sign of a distant background person.
+        # On a substantial main component, keep them only when they are not an
+        # extreme scale outlier. This also keeps face-count ranking stable.
+        if face_ref is not None and len(face_info) > 1 and f["height"] < face_ref * 0.35:
+            continue
+        filtered_faces.append(f["box"])
+
+    # If conservative filtering would remove every face, keep the best-sized face
+    # that still belongs to a retained component rather than losing face guidance.
+    if face_info and not filtered_faces:
+        candidates = [f for f in face_info if f["component"] in kept]
+        if candidates:
+            best = max(candidates, key=lambda f: f["height"])
+            filtered_faces = [best["box"]]
+
+    return kept_components, filtered_faces
+
+
+def human_geometry_from_mask(mask, np, cv2, face_boxes=None):
+    """Return main-group envelope, foreground X center and filtered face boxes."""
+    h, w = mask.shape[:2]
+    components = _human_components(mask, np, cv2)
+    if not components:
+        return None, None, []
+
+    if face_boxes:
+        components, filtered_faces = _filter_main_group(components, face_boxes, w, h)
+    else:
+        filtered_faces = []
+    if not components:
+        return None, None, []
+
+    kept_area = sum(c["area"] for c in components)
+    weighted_x = sum(c["center_x"] * c["area"] for c in components)
     center_x = weighted_x / kept_area if kept_area > 0 else None
-    return union_boxes(kept), center_x
+    return union_boxes([c["bbox"] for c in components]), center_x, filtered_faces
 
 
-def visual_center_x(mask_bbox, mask_center_x, face_boxes):
+def visual_center_x(mask_bbox, mask_center_x, face_boxes, side_cropped=False):
     """Estimate a stable horizontal visual center for a person or a group.
 
-    The segmentation center of mass is the stable base. Detected faces nudge it
-    toward where viewers naturally perceive people: a single face has moderate
-    influence; a group uses the equal-weight mean of face centers more strongly.
-    Faces clearly outside the segmented group are ignored.
+    Normally the segmentation center of mass is the stable base and faces nudge
+    it toward the perceptual center. If the human mask touches a side of the source
+    image, bbox/mask symmetry is no longer trustworthy, so retained faces become
+    the primary horizontal anchor.
     """
     if mask_bbox is None:
         return None
@@ -228,15 +361,16 @@ def visual_center_x(mask_bbox, mask_center_x, face_boxes):
 
     if centers:
         face_center = sum(centers) / float(len(centers))
-        # Keep the result stable when only one face is visible, but let a set of
-        # faces describe a group's visual center with equal weight per person.
-        face_weight = 0.65 if len(centers) >= 2 else 0.55
+        if side_cropped:
+            # A side-cropped body has an incomplete mask/bbox. Faces are the most
+            # reliable visible landmarks for the person's/group's perceived center.
+            face_weight = 0.90 if len(centers) >= 2 else 0.85
+        else:
+            face_weight = 0.65 if len(centers) >= 2 else 0.55
         result = face_center * face_weight + base * (1.0 - face_weight)
     else:
         result = base
 
-    # Never allow an imperfect face detection to pull the anchor outside the
-    # actual detected human envelope.
     return max(x1, min(x2, result))
 
 
@@ -246,16 +380,14 @@ def analyze_image(path):
     if image is None:
         raise RuntimeError("Cannot read preview: %s" % path)
     h, w = image.shape[:2]
-    # OpenCV DNN objects keep mutable internal state; serialize access.
     with model_lock:
         human_mask = human_segmenter.mask(image)
         face_detections = face_detector.detect(image)
 
-    bbox, mask_center_x = human_geometry_from_mask(human_mask, np, cv2)
-    face_boxes = face_detections
+    bbox, mask_center_x, face_boxes = human_geometry_from_mask(human_mask, np, cv2, face_detections)
 
-    # Refine the coarse 192x192 segmentation only around the detected group. This keeps
-    # the model tiny/fast while giving the final bounding box noticeably finer geometry.
+    # Refine only the already-filtered main group. A small detached background
+    # person therefore cannot unnecessarily enlarge the high-resolution crop.
     if bbox is not None and w >= 400 and h >= 300:
         bx1, by1, bx2, by2 = bbox
         margin_x = max(8.0, (bx2 - bx1) * 0.12)
@@ -268,7 +400,14 @@ def analyze_image(path):
             crop = image[cy1:cy2, cx1:cx2]
             with model_lock:
                 refined_mask = human_segmenter.mask(crop)
-            refined, refined_center_x = human_geometry_from_mask(refined_mask, np, cv2)
+            local_faces = []
+            for fx1, fy1, fx2, fy2 in face_boxes:
+                if fx2 < cx1 or fx1 > cx2 or fy2 < cy1 or fy1 > cy2:
+                    continue
+                local_faces.append([fx1 - cx1, fy1 - cy1, fx2 - cx1, fy2 - cy1])
+            refined, refined_center_x, refined_faces = human_geometry_from_mask(
+                refined_mask, np, cv2, local_faces
+            )
             if refined is not None:
                 bbox = [
                     refined[0] + cx1,
@@ -278,20 +417,25 @@ def analyze_image(path):
                 ]
                 if refined_center_x is not None:
                     mask_center_x = refined_center_x + cx1
+                if refined_faces:
+                    face_boxes = [[f[0] + cx1, f[1] + cy1, f[2] + cx1, f[3] + cy1] for f in refined_faces]
 
-    # Compute the horizontal visual center from the human mask plus face positions
-    # before face boxes expand the outer envelope. This keeps a stray face box from
-    # redefining the composition while still allowing valid heads to extend the bbox.
-    visual_x = visual_center_x(bbox, mask_center_x, face_boxes)
+    # A mask touching either side of the source image is an open/cropped shape.
+    # In that case its rectangular center is biased by the missing body area, so
+    # retained face positions become the dominant horizontal-center cue.
+    side_tol = max(2.0, float(w) * 0.0025)
+    side_cropped = bool(
+        bbox is not None and (float(bbox[0]) <= side_tol or float(w) - float(bbox[2]) <= side_tol)
+    )
+    visual_x = visual_center_x(bbox, mask_center_x, face_boxes, side_cropped)
 
-    # The segmentation model can occasionally trim hair/head edges. Face boxes are
-    # therefore allowed to expand the group envelope, but never replace a missing mask.
+    # Face boxes may restore a head/hair edge trimmed by segmentation, but only
+    # faces retained as part of the main group are allowed to expand the envelope.
     if bbox is not None and face_boxes:
         bbox = union_boxes([bbox] + face_boxes)
 
     bbox = clamp_bbox(bbox, w, h)
     if bbox is not None:
-        # Small safety margin: original script also leaves free border around the subject.
         pad_x = max(1.0, w * 0.004)
         pad_top = max(1.0, h * 0.004)
         pad_bottom = max(1.0, h * 0.006)

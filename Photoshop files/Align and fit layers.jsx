@@ -17,14 +17,14 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.5.29',
+var SCRIPT_VERSION = '0.5.31',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
     API_PORT_LISTEN = 6321,
     API_FILES = ['lib/align-fit-api.pyw', 'align-fit-api.pyw'],
     RUNTIME_NAME = 'AlignFitRuntime',
-    EXPECTED_SERVER_VERSION = '0.4.5',
+    EXPECTED_SERVER_VERSION = '0.4.6',
     PREVIEW_MAX = 1280,
     FINAL_BLEED_PX = 2,
     INIT_DELAY = 15000,
@@ -1476,7 +1476,16 @@ function getObjectPlacementSolution(subject, frame) {
         desiredBottom = frameH * ((frame.vertical ? cfg.vBottom : cfg.hBottom) / 100),
         desiredSide = frameW * ((frame.vertical ? cfg.vSide : cfg.hSide) / 100),
         preferredBleed = FINAL_BLEED_PX > 0 ? FINAL_BLEED_PX : 0,
-        eps = 0.000001;
+        eps = 0.000001,
+        // When the detected object reaches the bottom edge of the source layer,
+        // its lower boundary is not a trustworthy end of the person/group: the
+        // body is usually cropped by the original photograph (head-and-shoulders,
+        // waist-up portrait, etc.). Treat that as an open-bottom object and use
+        // the top-anchored composition even if the rectangular bbox could be
+        // mathematically fitted inside the frame. A small relative tolerance also
+        // absorbs preview scaling / segmentation rounding.
+        edgeTolerance = Math.max(2, layerH * 0.0025),
+        croppedAtBottom = bottomSpace <= edgeTolerance;
 
     visualCenterLocalX = Math.max(localLeft, Math.min(localRight, visualCenterLocalX));
 
@@ -1705,8 +1714,15 @@ function getObjectPlacementSolution(subject, frame) {
     }
 
     // The anti-seam bleed must never be the reason the subject is cropped.
-    var solution = solveFit(preferredBleed);
-    if (!solution && preferredBleed > 0) solution = solveFit(0);
+    // If the detected object reaches the bottom edge of the source photograph,
+    // do not use the full-object centering branch: the bbox is open at the bottom
+    // and would create an artificial large top gap. In that case use the same
+    // top anchor as for a genuinely oversized object.
+    var solution = null;
+    if (!croppedAtBottom) {
+        solution = solveFit(preferredBleed);
+        if (!solution && preferredBleed > 0) solution = solveFit(0);
+    }
     if (!solution) {
         solution = solveOversized(preferredBleed);
         if (!solution && preferredBleed > 0) solution = solveOversized(0);
