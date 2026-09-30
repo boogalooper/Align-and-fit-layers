@@ -17,7 +17,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.5.33',
+var SCRIPT_VERSION = '0.5.34',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
@@ -303,8 +303,12 @@ function createRunContext() {
 }
 
 function preparePythonStage() {
-    var ctx = runCtx;
+    var ctx = runCtx,
+        oldDialogs = app.displayDialogs;
     try {
+        // All Photoshop actions used by preview preparation are silent. Set this
+        // once for the batch instead of crossing the DOM bridge for every layer.
+        app.displayDialogs = DialogModes.NO;
         ctx.sourceDoc.suspendHistory('Prepare Align and Fit previews', 'preparePythonPreviewsLoop();');
         if (!ctx.items.length || ctx.items.length != ctx.subjectTargetIds.length) {
             throw new Error('Python preview export incomplete: ' + ctx.items.length + ' of ' + ctx.subjectTargetIds.length + ' layers.');
@@ -325,6 +329,8 @@ function preparePythonStage() {
             throw new Error(e.message + '\nAdditionally failed to restore preview history: ' + restoreError.message);
         }
         throw e;
+    } finally {
+        app.displayDialogs = oldDialogs;
     }
 }
 
@@ -439,10 +445,11 @@ function measureAutoCutoutInSmartObject(sourceDoc, id) {
         // Match the Python preparation path: analyze the visible composite of the
         // selected layer in its own local coordinate system.
         stage = 'flatten Smart Object contents';
-        if (smartDoc.layers.length > 1) smartDoc.flatten();
+        if (Number(doc.getProperty('numberOfLayers')) > 1) doc.flatten();
 
-        var localW = Number(smartDoc.width.as('px')),
-            localH = Number(smartDoc.height.as('px'));
+        var localInfo = doc.getDocumentInfo(),
+            localW = localInfo ? Number(localInfo.width) : 0,
+            localH = localInfo ? Number(localInfo.height) : 0;
         if (!(localW > 0) || !(localH > 0)) throw new Error('Smart Object has invalid dimensions.');
 
         stage = 'Select Subject';
@@ -463,7 +470,7 @@ function measureAutoCutoutInSmartObject(sourceDoc, id) {
         };
 
         stage = 'close Smart Object contents';
-        smartDoc.close(SaveOptions.DONOTSAVECHANGES);
+        doc.close(false);
         smartDoc = null;
         app.activeDocument = sourceDoc;
         return out;
@@ -471,7 +478,7 @@ function measureAutoCutoutInSmartObject(sourceDoc, id) {
         try {
             if (smartDoc) {
                 app.activeDocument = smartDoc;
-                smartDoc.close(SaveOptions.DONOTSAVECHANGES);
+                doc.close(false);
                 smartDoc = null;
             }
         } catch (ignore0) { }
@@ -1299,13 +1306,10 @@ function finishSubjectGeometry(subject, layerBounds) {
 function exportLayerPreview(sourceDoc, id, index, tempFiles) {
     var smartDoc = null,
         file = null,
-        oldDialogs = app.displayDialogs,
-        stage = 'select source layer';
+        stage = 'prepare source layer';
     try {
-        app.displayDialogs = DialogModes.NO;
-        app.activeDocument = sourceDoc;
-        lr.selectLayer(id);
-
+        // preparePythonPreviewChunk() already made sourceDoc active and selected id.
+        // Avoid repeating a document switch and layer selection for every preview.
         var stamp = (new Date()).getTime(),
             token = Math.floor(Math.random() * 1000000);
 
@@ -1334,19 +1338,32 @@ function exportLayerPreview(sourceDoc, id, index, tempFiles) {
         stage = 'flatten Smart Object contents';
         doc.flatten();
 
+        // Read the temporary document descriptor once instead of crossing the
+        // slower DOM bridge for mode, bit depth and dimensions independently.
+        stage = 'read preview properties';
+        var previewInfo = doc.getDocumentInfo();
+        if (!previewInfo || !(previewInfo.width > 0) || !(previewInfo.height > 0)) {
+            throw new Error('Smart Object has invalid dimensions.');
+        }
+
         stage = 'convert preview to RGB/8-bit';
-        try {
-            if (smartDoc.mode != DocumentMode.RGB) doc.convertToRGB();
-        } catch (modeError) { }
-        try {
-            if (smartDoc.bitsPerChannel != BitsPerChannelType.EIGHT) smartDoc.bitsPerChannel = BitsPerChannelType.EIGHT;
-        } catch (bitsError) { }
+        if (previewInfo.mode && previewInfo.mode != 'RGBColor' && previewInfo.mode != 'RGBColorMode') {
+            doc.convertToRGB();
+        } else if (!previewInfo.mode) {
+            // Very old/atypical Photoshop descriptors may omit the mode. Keep a
+            // compatibility fallback; it is not used on normal current versions.
+            try { if (smartDoc.mode != DocumentMode.RGB) doc.convertToRGB(); } catch (modeError) { }
+        }
+        if (previewInfo.depth && previewInfo.depth != 8) {
+            doc.convertTo8Bit();
+        } else if (!previewInfo.depth) {
+            try { if (smartDoc.bitsPerChannel != BitsPerChannelType.EIGHT) smartDoc.bitsPerChannel = BitsPerChannelType.EIGHT; } catch (bitsError) { }
+        }
 
         stage = 'resize preview';
-        var tw = Number(smartDoc.width.as('px')),
-            th = Number(smartDoc.height.as('px')),
+        var tw = Number(previewInfo.width),
+            th = Number(previewInfo.height),
             maxSide = Math.max(tw, th);
-        if (!(tw > 0) || !(th > 0)) throw new Error('Smart Object has invalid dimensions.');
         if (maxSide > PREVIEW_MAX) {
             var k = PREVIEW_MAX / maxSide;
             doc.setScale(k);
@@ -1357,12 +1374,9 @@ function exportLayerPreview(sourceDoc, id, index, tempFiles) {
         doc.saveJpegCopy(file, 6);
         if (!file.exists) throw new Error('JPEG file was not created.');
 
-        var out = {
-            id: id,
-            path: file.fsName,
-            width: Math.round(Number(smartDoc.width.as('px'))),
-            height: Math.round(Number(smartDoc.height.as('px')))
-        };
+        // Python reads the JPEG and returns its real pixel dimensions with the
+        // detection result, so sending preview width/height here was redundant.
+        var out = { id: id, path: file.fsName };
         tempFiles.push(file);
 
         stage = 'close Smart Object contents';
@@ -1374,7 +1388,7 @@ function exportLayerPreview(sourceDoc, id, index, tempFiles) {
         try {
             if (smartDoc) {
                 app.activeDocument = smartDoc;
-                smartDoc.close(SaveOptions.DONOTSAVECHANGES);
+                doc.close(false);
                 smartDoc = null;
             }
         } catch (ignore0) { }
@@ -1383,7 +1397,6 @@ function exportLayerPreview(sourceDoc, id, index, tempFiles) {
         throw new Error('Cannot create JPEG preview for layer ' + id + ' [' + stage + ']: ' + e.message);
     } finally {
         try { app.activeDocument = sourceDoc; } catch (ignore3) { }
-        app.displayDialogs = oldDialogs;
     }
 }
 
@@ -2097,12 +2110,45 @@ function AM(target, order) {
         (d = new ActionDescriptor()).putReference(s2t('target'), r);
         executeAction(s2t('rasterizeLayer'), d, DialogModes.NO);
     }
+    this.getDocumentInfo = function () {
+        // A single document descriptor is faster than several DOM property
+        // accesses. Photoshop reports document width/height in points here, so
+        // convert them to pixels using the current resolution.
+        (r = new ActionReference()).putEnumerated(s2t('document'), s2t('ordinal'), s2t('targetEnum'));
+        var dd = executeActionGet(r),
+            kw = s2t('width'),
+            kh = s2t('height'),
+            kr = s2t('resolution'),
+            km = s2t('mode'),
+            kd = s2t('depth'),
+            resolution = dd.hasKey(kr) ? Number(dd.getUnitDoubleValue(kr)) : 0,
+            width = dd.hasKey(kw) ? Number(dd.getUnitDoubleValue(kw)) : 0,
+            height = dd.hasKey(kh) ? Number(dd.getUnitDoubleValue(kh)) : 0,
+            mode = '',
+            depth = 0;
+        if (resolution > 0) {
+            width = width * resolution / 72;
+            height = height * resolution / 72;
+        }
+        if (dd.hasKey(km)) {
+            try { mode = t2s(dd.getEnumerationValue(km)); } catch (e0) { }
+        }
+        if (dd.hasKey(kd)) {
+            try { depth = Number(dd.getInteger(kd)); } catch (e1) { }
+        }
+        return { width: width, height: height, resolution: resolution, mode: mode, depth: depth };
+    }
     this.flatten = function () {
         executeAction(s2t('flattenImage'), undefined, DialogModes.NO);
     }
     this.convertToRGB = function () {
         (d = new ActionDescriptor()).putClass(s2t('to'), s2t('RGBColorMode'));
         executeAction(s2t('convertMode'), d, DialogModes.NO);
+    }
+    this.convertTo8Bit = function () {
+        // ScriptListener form of Image > Mode > 8 Bits/Channel.
+        (d = new ActionDescriptor()).putInteger(charIDToTypeID('Dpth'), 8);
+        executeAction(charIDToTypeID('CnvM'), d, DialogModes.NO);
     }
     this.setScale = function (scale) {
         (d = new ActionDescriptor()).putUnitDouble(s2t('width'), s2t('percentUnit'), scale * 100);
