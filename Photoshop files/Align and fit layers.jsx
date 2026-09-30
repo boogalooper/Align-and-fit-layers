@@ -17,7 +17,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.5.37',
+var SCRIPT_VERSION = '0.5.38',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
@@ -2166,7 +2166,9 @@ function AM(target, order) {
         (d = new ActionDescriptor()).putUnitDouble(s2t('width'), s2t('percentUnit'), scale * 100);
         d.putBoolean(s2t('scaleStyles'), true);
         d.putBoolean(s2t('constrainProportions'), true);
-        d.putEnumerated(s2t('interpolation'), s2t('interpolationType'), s2t('bilinear'));
+        // Preview is detector input only. Nearest Neighbor is the cheapest
+        // resampling method and avoids spending time on visual-quality filtering.
+        d.putEnumerated(s2t('interpolation'), s2t('interpolationType'), s2t('nearestNeighbor'));
         executeAction(s2t('imageSize'), d, DialogModes.NO);
     }
     this.saveJpegCopy = function (pth, quality) {
