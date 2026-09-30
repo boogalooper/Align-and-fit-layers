@@ -17,7 +17,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.5.32',
+var SCRIPT_VERSION = '0.5.33',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
@@ -1311,6 +1311,15 @@ function exportLayerPreview(sourceDoc, id, index, tempFiles) {
 
         // Work on the ORIGINAL layer. Do not Undo here: all preview-related
         // conversions are restored together after the complete preview pass.
+        // Rasterizing an existing Smart Object first avoids creating a nested
+        // Smart Object whose contents Photoshop must repeatedly render while
+        // resizing/exporting the temporary preview. The source state is restored
+        // by the single history rollback after the whole preview pass.
+        if (lr.hasProperty('smartObject')) {
+            stage = 'rasterize existing Smart Object for preview';
+            lr.rasterize();
+        }
+
         stage = 'convert source layer to Smart Object';
         convertActiveLayerToSmartObject();
 
@@ -1319,14 +1328,19 @@ function exportLayerPreview(sourceDoc, id, index, tempFiles) {
         smartDoc = app.activeDocument;
         if (!smartDoc || smartDoc == sourceDoc) throw new Error('Smart Object contents did not open.');
 
+        // Flatten even a one-layer temporary Smart Object. In the common case
+        // that layer is itself a placed/rasterized object; flattening it before
+        // imageSize/save avoids extra Smart Object rendering during export.
         stage = 'flatten Smart Object contents';
-        if (smartDoc.layers.length > 1) smartDoc.flatten();
+        doc.flatten();
 
         stage = 'convert preview to RGB/8-bit';
         try {
-            if (smartDoc.mode != DocumentMode.RGB) smartDoc.changeMode(ChangeMode.RGB);
+            if (smartDoc.mode != DocumentMode.RGB) doc.convertToRGB();
         } catch (modeError) { }
-        try { smartDoc.bitsPerChannel = BitsPerChannelType.EIGHT; } catch (bitsError) { }
+        try {
+            if (smartDoc.bitsPerChannel != BitsPerChannelType.EIGHT) smartDoc.bitsPerChannel = BitsPerChannelType.EIGHT;
+        } catch (bitsError) { }
 
         stage = 'resize preview';
         var tw = Number(smartDoc.width.as('px')),
@@ -1335,17 +1349,12 @@ function exportLayerPreview(sourceDoc, id, index, tempFiles) {
         if (!(tw > 0) || !(th > 0)) throw new Error('Smart Object has invalid dimensions.');
         if (maxSide > PREVIEW_MAX) {
             var k = PREVIEW_MAX / maxSide;
-            smartDoc.resizeImage(UnitValue(Math.max(1, Math.round(tw * k)), 'px'),
-                UnitValue(Math.max(1, Math.round(th * k)), 'px'), null, ResampleMethod.BILINEAR);
+            doc.setScale(k);
         }
 
         stage = 'save JPEG preview';
         file = new File(Folder.temp.fsName + '/align_fit_' + stamp + '_' + id + '_' + index + '_' + token + '.jpg');
-        var jpg = new JPEGSaveOptions();
-        jpg.quality = 6;
-        jpg.embedColorProfile = false;
-        jpg.formatOptions = FormatOptions.STANDARDBASELINE;
-        smartDoc.saveAs(file, jpg, true, Extension.LOWERCASE);
+        doc.saveJpegCopy(file, 6);
         if (!file.exists) throw new Error('JPEG file was not created.');
 
         var out = {
@@ -1357,7 +1366,7 @@ function exportLayerPreview(sourceDoc, id, index, tempFiles) {
         tempFiles.push(file);
 
         stage = 'close Smart Object contents';
-        smartDoc.close(SaveOptions.DONOTSAVECHANGES);
+        doc.close(false);
         smartDoc = null;
         app.activeDocument = sourceDoc;
         return out;
@@ -2082,6 +2091,39 @@ function AM(target, order) {
         d.putReference(s2t('from'), r1);
         d.putUnitDouble(s2t('tolerance'), s2t('pixelsUnit'), 10);
         executeAction(s2t('make'), d, DialogModes.NO);
+    }
+    this.rasterize = function () {
+        (r = new ActionReference()).putEnumerated(s2t('layer'), s2t('ordinal'), s2t('targetEnum'));
+        (d = new ActionDescriptor()).putReference(s2t('target'), r);
+        executeAction(s2t('rasterizeLayer'), d, DialogModes.NO);
+    }
+    this.flatten = function () {
+        executeAction(s2t('flattenImage'), undefined, DialogModes.NO);
+    }
+    this.convertToRGB = function () {
+        (d = new ActionDescriptor()).putClass(s2t('to'), s2t('RGBColorMode'));
+        executeAction(s2t('convertMode'), d, DialogModes.NO);
+    }
+    this.setScale = function (scale) {
+        (d = new ActionDescriptor()).putUnitDouble(s2t('width'), s2t('percentUnit'), scale * 100);
+        d.putBoolean(s2t('scaleStyles'), true);
+        d.putBoolean(s2t('constrainProportions'), true);
+        d.putEnumerated(s2t('interpolation'), s2t('interpolationType'), s2t('bilinear'));
+        executeAction(s2t('imageSize'), d, DialogModes.NO);
+    }
+    this.saveJpegCopy = function (pth, quality) {
+        quality = quality == undefined ? 6 : quality;
+        (d1 = new ActionDescriptor()).putInteger(s2t('extendedQuality'), quality);
+        d1.putEnumerated(s2t('matteColor'), s2t('matteColor'), s2t('none'));
+        (d = new ActionDescriptor()).putObject(s2t('as'), s2t('JPEG'), d1);
+        d.putPath(s2t('in'), pth);
+        d.putBoolean(s2t('copy'), true);
+        executeAction(s2t('save'), d, DialogModes.NO);
+    }
+    this.close = function (save) {
+        save = save == true ? s2t('yes') : s2t('no');
+        (d = new ActionDescriptor()).putEnumerated(s2t('saving'), s2t('yesNo'), save);
+        executeAction(s2t('close'), d, DialogModes.NO);
     }
     this.setLayerVisiblity = function (id, makeVisible) {
         var mode = makeVisible ? "show" : "hide";
