@@ -1,4 +1,4 @@
-#target photoshop
+﻿#target photoshop
 /*
 // BEGIN__HARVEST_EXCEPTION_ZSTRING
 <javascriptresource>
@@ -17,7 +17,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.5.34',
+var SCRIPT_VERSION = '0.5.37',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
@@ -31,6 +31,10 @@ var SCRIPT_VERSION = '0.5.34',
     ANALYZE_DELAY = 120000,
     MATCH_DELAY = 10000,
     PING_DELAY = 500,
+    PYTHON_ANALYZE_EXPECTED_MS = 3000,
+    PROGRESS_STAGE_TARGET = 0.95,
+    API_POLL_INTERVAL = 25,
+    API_POLL_SLEEP = 5,
     lr = new AM('layer'),
     doc = new AM('document'),
     previousLayer = new AM('layer', 'backwardEnum'),
@@ -346,7 +350,7 @@ function preparePythonPreviewChunk(i) {
     var id = runCtx.subjectTargetIds[i],
         meta = runCtx.layerMeta[String(id)],
         name = meta ? meta.name : lr.getProperty('name', false, id),
-        text = L(str.prepareImages) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' \u2014 ' + name;
+        text = L(str.prepareImages) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' — ' + name;
     app.activeDocument = runCtx.sourceDoc;
     lr.selectLayer(id);
     if (!lr.getProperty('visible')) lr.setLayerVisiblity(id, true);
@@ -357,12 +361,20 @@ function preparePythonPreviewChunk(i) {
     $.sleep(0);
 }
 
+function pythonAnalysisProgressChunk() {
+    // app.doProgressTask() needs a globally visible work function. Calling it
+    // repeatedly from the socket polling loop advances the current Photoshop
+    // progress segment while Python is still working.
+    app.changeProgressText(L(str.analyzePython));
+    $.sleep(0);
+}
+
 function analyzePythonStage() {
     app.changeProgressText(L(str.analyzePython));
     // Large selections can legitimately take longer than the fixed base timeout.
     // Keep a generous per-image allowance while capping the wait at 15 minutes.
     var analyzeDelay = Math.max(ANALYZE_DELAY, Math.min(15 * 60 * 1000, runCtx.items.length * 10000)),
-        analyzed = afApi.sendPayload('analyze', { items: runCtx.items }, analyzeDelay);
+        analyzed = afApi.sendPayload('analyze', { items: runCtx.items }, analyzeDelay, true);
     if (!analyzed || !analyzed.items) throw new Error('Python returned an invalid analysis response.');
     runCtx.analysisMap = {};
     for (var ai = 0; ai < analyzed.items.length; ai++) {
@@ -410,7 +422,7 @@ function prepareAutoCutoutChunk(i) {
     var id = runCtx.subjectTargetIds[i],
         meta = runCtx.layerMeta[String(id)],
         name = meta ? meta.name : lr.getProperty('name', false, id),
-        text = L(str.detectBounds) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' \u2014 ' + name;
+        text = L(str.detectBounds) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' — ' + name;
     app.activeDocument = runCtx.sourceDoc;
     lr.selectLayer(id);
     if (!lr.getProperty('visible')) lr.setLayerVisiblity(id, true);
@@ -538,7 +550,7 @@ function collectSubjectChunk(i) {
     var id = runCtx.subjectTargetIds[i],
         meta = runCtx.layerMeta[String(id)],
         layerName = meta ? meta.name : lr.getProperty('name', false, id),
-        text = L(str.detectBounds) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' \u2014 ' + layerName;
+        text = L(str.detectBounds) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' — ' + layerName;
 
     doc.selectLayer(id);
     if (!lr.getProperty('visible')) lr.setLayerVisiblity(id, true);
@@ -695,7 +707,7 @@ function readFramesStage() {
 function readFrameChunk(i) {
     var id = runCtx.frames[i],
         frameName = lr.getProperty('name', false, id),
-        text = L(str.readFrames) + ': ' + (i + 1) + '/' + runCtx.frames.length + ' \u2014 ' + frameName;
+        text = L(str.readFrames) + ': ' + (i + 1) + '/' + runCtx.frames.length + ' — ' + frameName;
 
     doc.makeSelection(id, lr.getProperty('hasVectorMask', false, id) && !(lr.hasProperty('vectorMaskEmpty', id) ? lr.getProperty('vectorMaskEmpty', false, id) : true));
     doc.setQuickMask(true);
@@ -797,7 +809,7 @@ function alignSubjectsStage() {
 function alignSubjectChunk(i) {
     var subject = runCtx.subjects[i],
         layerName = lr.getProperty('name', false, subject.id),
-        text = L(str.align) + ': ' + (i + 1) + '/' + runCtx.subjects.length + ' \u2014 ' + layerName,
+        text = L(str.align) + ': ' + (i + 1) + '/' + runCtx.subjects.length + ' — ' + layerName,
         frame = null;
 
     if (runCtx.allClippedAtStart) {
@@ -1222,59 +1234,59 @@ function Config() {
     };
 }
 function Locale() {
-    this.title = { ru: '\u0412\u044B\u0440\u0430\u0432\u043D\u0438\u0432\u0430\u043D\u0438\u0435 \u0438 \u0432\u043F\u0438\u0441\u044B\u0432\u0430\u043D\u0438\u0435', en: 'Align and fit layers' };
-    this.err = { ru: '\u0421\u043A\u0440\u0438\u043F\u0442 \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D', en: 'Script stopped' };
-    this.errDoc = { ru: '\u041D\u0435\u0442 \u0430\u043A\u0442\u0438\u0432\u043D\u043E\u0433\u043E \u0434\u043E\u043A\u0443\u043C\u0435\u043D\u0442\u0430!', en: 'No active document!' };
-    this.errLayers = { ru: '\u041D\u0435 \u0432\u044B\u0431\u0440\u0430\u043D\u044B \u0441\u043B\u043E\u0438 \u0434\u043B\u044F \u0432\u044B\u0440\u0430\u0432\u043D\u0438\u0432\u0430\u043D\u0438\u044F.', en: 'No layers are selected for alignment.' };
-    this.errLayerBounds = { ru: '\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u044C \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u0441\u043B\u043E\u044F', en: 'Cannot read layer bounds' };
-    this.errCloudMode = { ru: '\u041E\u0431\u043B\u0430\u0447\u043D\u044B\u0439 Select Subject \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D \u0432 \u044D\u0442\u043E\u0439 \u0432\u0435\u0440\u0441\u0438\u0438 Photoshop.', en: 'Cloud Select Subject is not available in this Photoshop version.' };
-    this.errFallbackFrame = { ru: '\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u0438\u0442\u044C \u043D\u0438\u0436\u043D\u0438\u0439 \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u044B\u0439 \u0441\u043B\u043E\u0439 \u0434\u043B\u044F fallback.', en: 'Cannot determine the bottom-most selected layer for fallback.' };
-    this.errFallbackClipped = { ru: '\u041D\u0435\u043B\u044C\u0437\u044F \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u044C fallback: \u0441\u0430\u043C\u044B\u0439 \u043D\u0438\u0436\u043D\u0438\u0439 \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u044B\u0439 \u0441\u043B\u043E\u0439 \u0443\u0436\u0435 \u043D\u0430\u0445\u043E\u0434\u0438\u0442\u0441\u044F \u0432 clipping. \u0420\u0430\u0431\u043E\u0442\u0430 \u0441\u043A\u0440\u0438\u043F\u0442\u0430 \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D\u0430.', en: 'Fallback cannot be used because the bottom-most selected layer is already clipped. The script has been stopped.' };
-    this.errMatching = { ru: '\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u0434\u043E\u0431\u0440\u0430\u0442\u044C \u0440\u0430\u043C\u043A\u0443 \u0434\u043B\u044F \u0441\u043B\u043E\u044F', en: 'Could not assign a frame to layer' };
-    this.warningTitle = { ru: '\u041D\u0435\u0445\u0432\u0430\u0442\u043A\u0430 \u0440\u0430\u043C\u043E\u043A', en: 'Missing frames' };
-    this.warnFrameCount = { ru: '\u041D\u0435 \u0445\u0432\u0430\u0442\u0430\u0435\u0442 \u0440\u0430\u043C\u043E\u043A \u0441 \u0441\u043E\u043E\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u044E\u0449\u0438\u043C\u0438 \u0446\u0432\u0435\u0442\u043E\u0432\u044B\u043C\u0438 \u043C\u0435\u0442\u043A\u0430\u043C\u0438: %MISSING% \u0438\u0437 %TOTAL%.\n\n\u0415\u0441\u043B\u0438 \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0438\u0442\u044C, \u0441\u043A\u0440\u0438\u043F\u0442 \u043E\u0431\u0440\u0430\u0431\u043E\u0442\u0430\u0435\u0442 \u0441\u043B\u043E\u0438, \u0434\u043B\u044F \u043A\u043E\u0442\u043E\u0440\u044B\u0445 \u0435\u0441\u0442\u044C \u0440\u0430\u043C\u043A\u0438. \u041E\u0441\u0442\u0430\u043B\u044C\u043D\u044B\u0435 \u0441\u043B\u043E\u0438 \u043E\u0441\u0442\u0430\u043D\u0443\u0442\u0441\u044F \u043D\u0430 \u0438\u0441\u0445\u043E\u0434\u043D\u044B\u0445 \u043F\u043E\u0437\u0438\u0446\u0438\u044F\u0445.', en: 'There are not enough frames with matching color labels: %MISSING% of %TOTAL%.\n\nIf you continue, the script will process layers that have matching frames. The remaining layers will stay in their original positions.' };
-    this.warnFrameDetails = { ru: '\u041F\u043E \u0446\u0432\u0435\u0442\u043E\u0432\u044B\u043C \u043C\u0435\u0442\u043A\u0430\u043C:', en: 'By color label:' };
-    this.continueButton = { ru: '\u041F\u0440\u043E\u0434\u043E\u043B\u0436\u0438\u0442\u044C', en: 'Continue' };
-    this.stopButton = { ru: '\u041E\u0441\u0442\u0430\u043D\u043E\u0432\u0438\u0442\u044C', en: 'Stop' };
-    this.progressTitle = { ru: '\u0412\u044B\u0440\u0430\u0432\u043D\u0438\u0432\u0430\u043D\u0438\u0435 \u0438 \u0432\u043F\u0438\u0441\u044B\u0432\u0430\u043D\u0438\u0435', en: 'Align and fit layers' };
-    this.startPython = { ru: '\u0417\u0430\u043F\u0443\u0441\u043A Python...', en: 'Starting Python...' };
-    this.prepareImages = { ru: '\u041F\u043E\u0434\u0433\u043E\u0442\u043E\u0432\u043A\u0430 \u0438\u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u0438\u0439', en: 'Prepare images' };
-    this.restoreLayers = { ru: '\u0412\u043E\u0441\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 \u0441\u043B\u043E\u0451\u0432...', en: 'Restore layers...' };
-    this.analyzePython = { ru: '\u0410\u043D\u0430\u043B\u0438\u0437 \u0438\u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u0438\u0439 Python...', en: 'Analyze images in Python...' };
-    this.detectBounds = { ru: '\u0413\u0440\u0430\u043D\u0438\u0446\u044B \u043E\u0431\u044A\u0435\u043A\u0442\u0430', en: 'Object bounds' };
-    this.readFrames = { ru: '\u0427\u0442\u0435\u043D\u0438\u0435 \u0440\u0430\u043C\u043E\u043A', en: 'Read frames' };
-    this.matchFrames = { ru: '\u0421\u043E\u0433\u043B\u0430\u0441\u043E\u0432\u0430\u043D\u0438\u0435 \u0440\u0430\u043C\u043E\u043A...', en: 'Match frames...' };
-    this.align = { ru: '\u0412\u044B\u0440\u0430\u0432\u043D\u0438\u0432\u0430\u043D\u0438\u0435', en: 'Align' };
-    this.done = { ru: '\u0413\u043E\u0442\u043E\u0432\u043E', en: 'Done' };
-    this.enginePanel = { ru: '\u041E\u043F\u0440\u0435\u0434\u0435\u043B\u0435\u043D\u0438\u0435 \u0433\u0440\u0430\u043D\u0438\u0446 \u043E\u0431\u044A\u0435\u043A\u0442\u0430', en: 'Object bounds engine' };
-    this.offsetPanel = { ru: '\u041E\u0442\u0441\u0442\u0443\u043F\u044B \u043E\u0431\u044A\u0435\u043A\u0442\u0430 \u043E\u0442 \u0440\u0430\u043C\u043A\u0438, %', en: 'Object margins inside frame, %' };
-    this.verticalFrame = { ru: '\u0412\u0435\u0440\u0442\u0438\u043A\u0430\u043B\u044C\u043D\u0430\u044F \u0440\u0430\u043C\u043A\u0430', en: 'Vertical frame' };
-    this.horizontalFrame = { ru: '\u0413\u043E\u0440\u0438\u0437\u043E\u043D\u0442\u0430\u043B\u044C\u043D\u0430\u044F \u0440\u0430\u043C\u043A\u0430', en: 'Horizontal frame' };
-    this.topOffset = { ru: '\u0421\u0432\u0435\u0440\u0445\u0443', en: 'Top' };
-    this.bottomOffset = { ru: '\u0421\u043D\u0438\u0437\u0443', en: 'Bottom' };
-    this.sideOffset = { ru: '\u041F\u043E \u0431\u043E\u043A\u0430\u043C', en: 'Sides' };
-    this.okButton = { ru: '\u0412\u044B\u043F\u043E\u043B\u043D\u0438\u0442\u044C', en: 'Run' };
-    this.save = { ru: '\u0421\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438', en: 'Save settings' };
-    this.cancel = { ru: '\u041E\u0442\u043C\u0435\u043D\u0430', en: 'Cancel' };
-    this.useFaceCount = { ru: '\u0423\u0447\u0438\u0442\u044B\u0432\u0430\u0442\u044C \u043A\u043E\u043B\u0438\u0447\u0435\u0441\u0442\u0432\u043E \u043B\u0438\u0446 \u043F\u0440\u0438 \u043F\u043E\u0434\u0431\u043E\u0440\u0435 \u0440\u0430\u043C\u043E\u043A', en: 'Use face count when matching frames' };
+    this.title = { ru: 'Выравнивание и вписывание', en: 'Align and fit layers' };
+    this.err = { ru: 'Скрипт остановлен', en: 'Script stopped' };
+    this.errDoc = { ru: 'Нет активного документа!', en: 'No active document!' };
+    this.errLayers = { ru: 'Не выбраны слои для выравнивания.', en: 'No layers are selected for alignment.' };
+    this.errLayerBounds = { ru: 'Не удалось получить границы слоя', en: 'Cannot read layer bounds' };
+    this.errCloudMode = { ru: 'Облачный Select Subject недоступен в этой версии Photoshop.', en: 'Cloud Select Subject is not available in this Photoshop version.' };
+    this.errFallbackFrame = { ru: 'Не удалось определить нижний выбранный слой для fallback.', en: 'Cannot determine the bottom-most selected layer for fallback.' };
+    this.errFallbackClipped = { ru: 'Нельзя использовать fallback: самый нижний выбранный слой уже находится в clipping. Работа скрипта остановлена.', en: 'Fallback cannot be used because the bottom-most selected layer is already clipped. The script has been stopped.' };
+    this.errMatching = { ru: 'Не удалось подобрать рамку для слоя', en: 'Could not assign a frame to layer' };
+    this.warningTitle = { ru: 'Нехватка рамок', en: 'Missing frames' };
+    this.warnFrameCount = { ru: 'Не хватает рамок с соответствующими цветовыми метками: %MISSING% из %TOTAL%.\n\nЕсли продолжить, скрипт обработает слои, для которых есть рамки. Остальные слои останутся на исходных позициях.', en: 'There are not enough frames with matching color labels: %MISSING% of %TOTAL%.\n\nIf you continue, the script will process layers that have matching frames. The remaining layers will stay in their original positions.' };
+    this.warnFrameDetails = { ru: 'По цветовым меткам:', en: 'By color label:' };
+    this.continueButton = { ru: 'Продолжить', en: 'Continue' };
+    this.stopButton = { ru: 'Остановить', en: 'Stop' };
+    this.progressTitle = { ru: 'Выравнивание и вписывание', en: 'Align and fit layers' };
+    this.startPython = { ru: 'Запуск Python...', en: 'Starting Python...' };
+    this.prepareImages = { ru: 'Подготовка изображений', en: 'Prepare images' };
+    this.restoreLayers = { ru: 'Восстановление слоёв...', en: 'Restore layers...' };
+    this.analyzePython = { ru: 'Анализ изображений Python...', en: 'Analyze images in Python...' };
+    this.detectBounds = { ru: 'Границы объекта', en: 'Object bounds' };
+    this.readFrames = { ru: 'Чтение рамок', en: 'Read frames' };
+    this.matchFrames = { ru: 'Согласование рамок...', en: 'Match frames...' };
+    this.align = { ru: 'Выравнивание', en: 'Align' };
+    this.done = { ru: 'Готово', en: 'Done' };
+    this.enginePanel = { ru: 'Определение границ объекта', en: 'Object bounds engine' };
+    this.offsetPanel = { ru: 'Отступы объекта от рамки, %', en: 'Object margins inside frame, %' };
+    this.verticalFrame = { ru: 'Вертикальная рамка', en: 'Vertical frame' };
+    this.horizontalFrame = { ru: 'Горизонтальная рамка', en: 'Horizontal frame' };
+    this.topOffset = { ru: 'Сверху', en: 'Top' };
+    this.bottomOffset = { ru: 'Снизу', en: 'Bottom' };
+    this.sideOffset = { ru: 'По бокам', en: 'Sides' };
+    this.okButton = { ru: 'Выполнить', en: 'Run' };
+    this.save = { ru: 'Сохранить настройки', en: 'Save settings' };
+    this.cancel = { ru: 'Отмена', en: 'Cancel' };
+    this.useFaceCount = { ru: 'Учитывать количество лиц при подборе рамок', en: 'Use face count when matching frames' };
     this.enginePython = { ru: 'Python', en: 'Python' };
-    this.engineDevice = { ru: 'autoCutout \u2014 on device', en: 'autoCutout \u2014 on device' };
-    this.engineCloud = { ru: 'autoCutout \u2014 in cloud', en: 'autoCutout \u2014 in cloud' };
-    this.engineLayer = { ru: '\u0413\u0440\u0430\u043D\u0438\u0446\u044B \u0441\u043B\u043E\u044F', en: 'Layer bounds' };
+    this.engineDevice = { ru: 'autoCutout — on device', en: 'autoCutout — on device' };
+    this.engineCloud = { ru: 'autoCutout — in cloud', en: 'autoCutout — in cloud' };
+    this.engineLayer = { ru: 'Границы слоя', en: 'Layer bounds' };
     this.descPython = {
-        ru: '\u0411\u044B\u0441\u0442\u0440\u044B\u0439 \u0430\u043D\u0430\u043B\u0438\u0437 \u0443\u043C\u0435\u043D\u044C\u0448\u0435\u043D\u043D\u044B\u0445 \u0438\u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u0438\u0439 \u0432\u043D\u0435\u0448\u043D\u0438\u043C \u043C\u043E\u0434\u0443\u043B\u0435\u043C. \u041E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442 \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u0433\u0440\u0443\u043F\u043F\u044B \u0438 \u043F\u0440\u0438\u043C\u0435\u0440\u043D\u043E\u0435 \u0447\u0438\u0441\u043B\u043E \u043B\u0438\u0446. \u041F\u0440\u0438 \u0432\u043A\u043B\u044E\u0447\u0435\u043D\u043D\u043E\u0439 \u043E\u043F\u0446\u0438\u0438 \u0447\u0438\u0441\u043B\u043E \u043B\u0438\u0446 \u0443\u0447\u0438\u0442\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u043F\u0440\u0438 \u043F\u043E\u0434\u0431\u043E\u0440\u0435 \u0440\u0430\u043C\u043E\u043A.',
+        ru: 'Быстрый анализ уменьшенных изображений внешним модулем. Определяет границы группы и примерное число лиц. При включенной опции число лиц учитывается при подборе рамок.',
         en: 'Fast external analysis of reduced previews. Detects the group bounds and an approximate face count. When enabled, face count is also used when matching photos to frames.'
     };
     this.descDevice = {
-        ru: 'Photoshop Select Subject: \u043E\u0431\u0440\u0430\u0431\u043E\u0442\u043A\u0430 \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u043E \u043D\u0430 \u0443\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432\u0435. \u0411\u044B\u0441\u0442\u0440\u0435\u0435 Cloud, \u043D\u043E \u043E\u0431\u044B\u0447\u043D\u043E \u043C\u0435\u043D\u0435\u0435 \u0442\u043E\u0447\u043D\u043E \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442 \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u043E\u0431\u044A\u0435\u043A\u0442\u0430. \u0427\u0438\u0441\u043B\u043E \u043B\u0438\u0446 \u043D\u0435 \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442\u0441\u044F.',
+        ru: 'Photoshop Select Subject: обработка локально на устройстве. Быстрее Cloud, но обычно менее точно определяет границы объекта. Число лиц не определяется.',
         en: 'Photoshop Select Subject processed locally on the device. Faster than Cloud, but usually less accurate at determining object bounds. Face count is not detected.'
     };
     this.descCloud = {
-        ru: 'Photoshop Select Subject: \u043E\u0431\u0440\u0430\u0431\u043E\u0442\u043A\u0430 \u0432 \u043E\u0431\u043B\u0430\u043A\u0435. \u041C\u0435\u0434\u043B\u0435\u043D\u043D\u0435\u0435 Device, \u043D\u043E \u043E\u0431\u044B\u0447\u043D\u043E \u0442\u043E\u0447\u043D\u0435\u0435 \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442 \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u043E\u0431\u044A\u0435\u043A\u0442\u0430. \u0427\u0438\u0441\u043B\u043E \u043B\u0438\u0446 \u043D\u0435 \u043E\u043F\u0440\u0435\u0434\u0435\u043B\u044F\u0435\u0442\u0441\u044F; \u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u0438\u043D\u0442\u0435\u0440\u043D\u0435\u0442.',
+        ru: 'Photoshop Select Subject: обработка в облаке. Медленнее Device, но обычно точнее определяет границы объекта. Число лиц не определяется; требуется интернет.',
         en: 'Photoshop Select Subject processed in the cloud. Slower than Device, but usually more accurate at determining object bounds. Face count is not detected; internet access is required.'
     };
     this.descLayer = {
-        ru: '\u0411\u0435\u0437 \u0434\u0435\u0442\u0435\u043A\u0446\u0438\u0438 \u043E\u0431\u044A\u0435\u043A\u0442\u043E\u0432 \u0438 \u043B\u0438\u0446. \u0421\u043B\u043E\u0438 \u0438 \u0440\u0430\u043C\u043A\u0438 \u0441\u043E\u0433\u043B\u0430\u0441\u0443\u044E\u0442\u0441\u044F \u043F\u043E \u043F\u0440\u043E\u043F\u043E\u0440\u0446\u0438\u044F\u043C; \u0437\u0430\u0442\u0435\u043C \u0432\u0435\u0441\u044C \u0441\u043B\u043E\u0439 \u0446\u0435\u043D\u0442\u0440\u0438\u0440\u0443\u0435\u0442\u0441\u044F \u0438 \u043C\u0430\u0441\u0448\u0442\u0430\u0431\u0438\u0440\u0443\u0435\u0442\u0441\u044F \u0442\u0430\u043A, \u0447\u0442\u043E\u0431\u044B \u0433\u0430\u0440\u0430\u043D\u0442\u0438\u0440\u043E\u0432\u0430\u043D\u043D\u043E \u043F\u0435\u0440\u0435\u043A\u0440\u044B\u0442\u044C \u0440\u0430\u043C\u043A\u0443. \u041D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438 \u043E\u0442\u0441\u0442\u0443\u043F\u043E\u0432 \u043D\u0435 \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u044E\u0442\u0441\u044F.',
+        ru: 'Без детекции объектов и лиц. Слои и рамки согласуются по пропорциям; затем весь слой центрируется и масштабируется так, чтобы гарантированно перекрыть рамку. Настройки отступов не используются.',
         en: 'No object or face detection. Layers and frames are matched by aspect ratio; the complete layer is then centered and scaled to fully cover the frame. Object margin settings are not used.'
     };
 }
@@ -2261,8 +2273,8 @@ function analysisApi(apiHost, portSend, portListen, apiFile, runtime) {
         throw new Error('Cannot connect to align-fit-api');
     };
 
-    this.sendPayload = function (type, payload, delay) {
-        var result = sendMessage({ type: type, message: payload }, delay, true, true);
+    this.sendPayload = function (type, payload, delay, animateProgress) {
+        var result = sendMessage({ type: type, message: payload }, delay, true, true, !!animateProgress);
         if (result) {
             if (result.type == 'answer') return result.message;
             if (result.type == 'error') throw new Error(result.message);
@@ -2289,18 +2301,19 @@ function analysisApi(apiHost, portSend, portListen, apiFile, runtime) {
         return lastResult;
     }
 
-    function sendMessage(o, delay, sendData, getData) {
+    function sendMessage(o, delay, sendData, getData, animateProgress) {
         delay = delay ? delay : INIT_DELAY;
         var requestId = String((new Date()).getTime()) + '-' + (++requestSeq),
             listener = null,
             t1 = 0,
-            t2 = 0;
+            t2 = 0,
+            t3 = 0;
         o.request_id = requestId;
 
         if (getData) {
             listener = new Socket();
             if (!listener.listen(portListen, 'UTF-8')) return null;
-            t1 = (new Date()).getTime();
+            t1 = t3 = (new Date()).getTime();
         }
 
         if (sendData) {
@@ -2321,6 +2334,27 @@ function analysisApi(apiHost, portSend, portListen, apiFile, runtime) {
                 if (listener) listener.close();
                 return null;
             }
+
+            // app.updateProgress() does not advance a nested
+            // app.doProgressSegmentTask() reliably. Use the same pattern as the
+            // API img2img helper: while polling the socket, repeatedly add a small
+            // doProgressTask() slice to the *current* analysis segment. The
+            // exponential curve approaches 95% of the segment and leaves its end
+            // for the actual Python reply.
+            if (animateProgress && t2 - t3 >= API_POLL_INTERVAL) {
+                var progressDelta = t2 - t3,
+                    slice = progressDelta > 0
+                        ? 1 - Math.pow(1 - PROGRESS_STAGE_TARGET, progressDelta / PYTHON_ANALYZE_EXPECTED_MS)
+                        : 0;
+                if (slice > 0 && !app.doProgressTask(slice, 'pythonAnalysisProgressChunk();')) {
+                    if (listener) listener.close();
+                    var cancelError = new Error('User cancelled');
+                    cancelError.number = 8007;
+                    throw cancelError;
+                }
+                t3 = t2;
+            }
+
             var answer = listener.poll();
             if (answer != null) {
                 var a = null;
@@ -2336,7 +2370,7 @@ function analysisApi(apiHost, portSend, portListen, apiFile, runtime) {
                 if (listener) listener.close();
                 return a;
             }
-            $.sleep(1);
+            $.sleep(animateProgress ? API_POLL_SLEEP : 1);
         }
     }
 
