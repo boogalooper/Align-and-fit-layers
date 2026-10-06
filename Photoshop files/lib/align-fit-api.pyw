@@ -10,7 +10,7 @@ API_HOST = "127.0.0.1"
 API_PORT_SEND = 6321       # Python -> JSX
 API_PORT_LISTEN = 6320     # JSX -> Python
 TIMEOUT = 15 * 60
-SERVER_VERSION = "0.4.6"
+SERVER_VERSION = "0.4.8"
 
 # Models are installed with the private runtime, outside the Photoshop folder.
 # sys.prefix points to the active venv when the server is started by launcher.vbs.
@@ -435,6 +435,8 @@ def analyze_image(path):
         bbox = union_boxes([bbox] + face_boxes)
 
     bbox = clamp_bbox(bbox, w, h)
+    # Preserve source-edge evidence independently of the padded safety envelope.
+    bottom_gap_ratio = (max(0.0, float(h) - float(bbox[3])) / float(h)) if bbox is not None else None
     if bbox is not None:
         pad_x = max(1.0, w * 0.004)
         pad_top = max(1.0, h * 0.004)
@@ -454,6 +456,7 @@ def analyze_image(path):
         "bbox": bbox,
         "faces": len(face_boxes),
         "visual_center_x": visual_x,
+        "bottom_gap_ratio": bottom_gap_ratio,
         "width": int(w),
         "height": int(h),
     }
@@ -562,9 +565,13 @@ def match_group(subjects, frames, use_face_count=True):
         # count/object size. Exclude it from the people-count ranking instead of
         # letting the artificial zero-face value distort the rest of the group.
         ranked_subjects = [x for x in subjects if not bool(x.get("bounds_only", False))]
+        # Pixel area depends on source resolution/crop, not on group size.
+        # When all counts tie, omit this preference entirely (also with surplus
+        # frames), so only the supplied composition costs decide the assignment.
+        use_face_count = len(set(int(x.get("faces", 0)) for x in ranked_subjects)) > 1
         s_rank = average_ranks(
             ranked_subjects,
-            lambda x: (int(x.get("faces", 0)), float(x.get("bbox_area", 0.0))),
+            lambda x: int(x.get("faces", 0)),
         )
         f_rank = average_ranks(frames, lambda x: float(x.get("area", 0.0)))
     else:

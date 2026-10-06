@@ -17,14 +17,14 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.5.38',
+var SCRIPT_VERSION = '0.5.41',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
     API_PORT_LISTEN = 6321,
     API_FILES = ['lib/align-fit-api.pyw', 'align-fit-api.pyw'],
     RUNTIME_NAME = 'AlignFitRuntime',
-    EXPECTED_SERVER_VERSION = '0.4.6',
+    EXPECTED_SERVER_VERSION = '0.4.8',
     PREVIEW_MAX = 1280,
     FINAL_BLEED_PX = 2,
     INIT_DELAY = 15000,
@@ -613,6 +613,11 @@ function subjectFromLocalAnalysis(id, analysis, fromPython) {
         }
         subject.width = subject.right - subject.left;
         subject.height = subject.bottom - subject.top;
+        // Relative source-edge distance, measured before Python's safety padding.
+        if (fromPython && analysis.bottom_gap_ratio != undefined &&
+            isFiniteNumber(Number(analysis.bottom_gap_ratio))) {
+            subject.bottomGapRatio = Math.max(0, Number(analysis.bottom_gap_ratio));
+        }
         if (!(subject.width > 1) || !(subject.height > 1)) return null;
         subject.center = { y: subject.top + subject.height / 2, x: subject.left + subject.width / 2 };
         subject.ratio = subject.width / subject.height;
@@ -752,7 +757,6 @@ function matchFramesStage() {
                 color: runCtx.subjects[i].color,
                 ratio: runCtx.subjects[i].ratio,
                 faces: runCtx.subjects[i].faces ? runCtx.subjects[i].faces : 0,
-                bbox_area: runCtx.subjects[i].width * runCtx.subjects[i].height,
                 bounds_only: !!runCtx.subjects[i].boundsOnly,
                 placement_costs: placementCosts
             });
@@ -1522,7 +1526,13 @@ function getObjectPlacementSolution(subject, frame) {
         edgeToleranceY = Math.max(2, layerH * 0.0025),
         croppedAtLeft = localLeft <= edgeToleranceX,
         croppedAtRight = rightSpace <= edgeToleranceX,
-        croppedAtBottom = bottomSpace <= edgeToleranceY;
+        rawBottomGap = subject.bottomGapRatio != undefined && isFiniteNumber(Number(subject.bottomGapRatio)) ?
+            Number(subject.bottomGapRatio) * layerH : bottomSpace,
+        bottomOpenWeight = Math.max(0, Math.min(1, (edgeToleranceY * 4 - rawBottomGap) / (edgeToleranceY * 3)));
+
+    // Blend uncertain near-edge detections instead of flipping composition on
+    // a single preview pixel. A true edge touch still uses the top anchor fully.
+    bottomOpenWeight = bottomOpenWeight * bottomOpenWeight * (3 - 2 * bottomOpenWeight);
 
     visualCenterLocalX = Math.max(localLeft, Math.min(localRight, visualCenterLocalX));
 
@@ -1735,76 +1745,37 @@ function getObjectPlacementSolution(subject, frame) {
         if (!(leftFromAnchor > eps) || !(rightFromAnchor > eps) || !(belowTopAnchor > eps)) return null;
 
         var targetX = Number(frame.center.x),
-            innerW = frameW - desiredSide * 2,
-            // First establish the object scale from its horizontal composition,
-            // not from whichever image edge happens to be closest to the frame.
-            // The layer-cover requirement may enlarge it further, but must never
-            // make the photograph edge the primary alignment target.
-            visualLeft = anchorLocalX - localLeft,
-            visualRight = localRight - anchorLocalX,
-            halfInnerW = Math.max(eps, innerW / 2),
-            scaleObjectX = Number.POSITIVE_INFINITY,
-            scaleLR;
-
-        if (visualLeft > eps) scaleObjectX = Math.min(scaleObjectX, halfInnerW / visualLeft);
-        if (visualRight > eps) scaleObjectX = Math.min(scaleObjectX, halfInnerW / visualRight);
-        if (!isFiniteNumber(scaleObjectX)) scaleObjectX = innerW > eps ? innerW / subjectW : frameW / subjectW;
-
-        scaleLR = Math.max(
-            (targetX - (Number(frame.left) - bleed)) / leftFromAnchor,
-            ((Number(frame.right) + bleed) - targetX) / rightFromAnchor
-        );
-        var scaleDesired = Math.max(
-                scaleObjectX,
-                scaleLR,
-                (frameH + bleed - desiredTop) / belowTopAnchor
+            scaleLR = Math.max(
+                (targetX - (Number(frame.left) - bleed)) / leftFromAnchor,
+                ((Number(frame.right) + bleed) - targetX) / rightFromAnchor
             ),
-            topCoveredWithDesired = localTop > eps ?
-                (localTop * scaleDesired >= desiredTop + bleed - eps) :
-                (desiredTop <= eps && bleed <= eps),
-            scale,
-            topMargin;
-
-        if (topCoveredWithDesired) {
-            scale = scaleDesired;
+            minCover = Math.max((frameW + 2 * bleed) / layerW,
+                (frameH + bleed - desiredTop) / belowTopAnchor),
+            centeredScale = Math.max(minCover, scaleLR),
+            // Side gaps are a stopping limit, never a reason to enlarge an
+            // already centered object. At a coverage-bound translation, this
+            // is the scale where the near-side object gap reaches its margin.
+            nearSpace = anchorLocalX < layerW / 2 ? localLeft : rightSpace,
+            sideStop = Math.max(eps, frameW - 2 * desiredSide) / subjectW;
+        if (nearSpace > eps) sideStop = Math.min(sideStop, (desiredSide + bleed) / nearSpace);
+        var scale = Math.min(centeredScale, Math.max(minCover, sideStop)),
             topMargin = desiredTop;
-        } else {
+
+        // Preserve the existing compromise when the source lacks headroom:
+        // reduce the top gap instead of magnifying just to create that gap.
+        if (localTop * scale < desiredTop + bleed - eps) {
             if (localTop <= eps && bleed > 0) return null;
-            scale = Math.max(scaleObjectX, scaleLR, (frameH + bleed * 2) / layerH);
+            scale = Math.max(scale, (frameH + 2 * bleed) / layerH);
             if (localTop > eps) scale = Math.max(scale, bleed / localTop);
-            topMargin = localTop * scale - bleed;
-            if (topMargin < 0) topMargin = 0;
-            if (topMargin > desiredTop) topMargin = desiredTop;
+            topMargin = Math.max(0, Math.min(desiredTop, localTop * scale - bleed));
         }
+        if (!(scale > 0) || !isFiniteNumber(scale)) return null;
 
-        if (!(scale > 0)) return null;
-
-        var tx = targetX - scale * anchorLocalX,
-            ty = Number(frame.top) + topMargin - scale * localTop,
-            left = tx,
-            top = ty,
-            right = tx + scale * layerW,
-            bottom = ty + scale * layerH,
-            extra = 1;
-
-        if (left > Number(frame.left) - bleed + eps) {
-            extra = Math.max(extra, (targetX - (Number(frame.left) - bleed)) / (scale * leftFromAnchor));
-        }
-        if (right < Number(frame.right) + bleed - eps) {
-            extra = Math.max(extra, ((Number(frame.right) + bleed) - targetX) / (scale * rightFromAnchor));
-        }
-        if (bottom < Number(frame.bottom) + bleed - eps) {
-            extra = Math.max(extra, ((Number(frame.bottom) + bleed) - (Number(frame.top) + topMargin)) / (scale * belowTopAnchor));
-        }
-        if (top > Number(frame.top) - bleed + eps && localTop > eps) {
-            extra = Math.max(extra, (topMargin + bleed) / (scale * localTop));
-        }
-
-        if (extra > 1 + eps) {
-            scale *= extra;
-            tx = targetX - scale * anchorLocalX;
+        // Pick the nearest feasible position to the visual center. Coverage is
+        // hard; a residual X offset is allowed once side margins stop enlargement.
+        var tx = clampValue(targetX - scale * anchorLocalX,
+                Number(frame.right) + bleed - scale * layerW, Number(frame.left) - bleed),
             ty = Number(frame.top) + topMargin - scale * localTop;
-        }
 
         return {
             scale: scale,
@@ -1856,67 +1827,73 @@ function getObjectPlacementSolution(subject, frame) {
         return Number(a.bleed) >= Number(b.bleed) ? a : b;
     }
 
-    var solution = null;
-    if (!croppedAtBottom) {
-        var fitWithBleed = solveFit(preferredBleed),
-            fitWithoutBleed = preferredBleed > 0 ? solveFit(0) : null;
-        solution = chooseFitSolution(fitWithBleed, fitWithoutBleed);
+    var fit = null, top = null;
+    if (bottomOpenWeight < 1) {
+        fit = chooseFitSolution(solveFit(preferredBleed), preferredBleed > 0 ? solveFit(0) : null);
     }
-    if (!solution) {
-        solution = solveOversized(preferredBleed);
-        if (!solution && preferredBleed > 0) solution = solveOversized(0);
+    if (!fit || bottomOpenWeight > 0) {
+        top = solveOversized(preferredBleed);
+        if (!top && preferredBleed > 0) top = solveOversized(0);
     }
+    var solution = fit || top;
+    if (fit && top && bottomOpenWeight > 0) {
+        // Convex interpolation of complete affine placements preserves layer
+        // coverage on all four sides. Do not interpolate scales alone.
+        var w = bottomOpenWeight;
+        solution = top;
+        solution.scale = fit.scale * (1 - w) + top.scale * w;
+        solution.tx = fit.tx * (1 - w) + top.tx * w;
+        solution.ty = fit.ty * (1 - w) + top.ty * w;
+        solution.bleed = Math.min(fit.bleed, top.bleed);
+        solution.topMargin = solution.ty + solution.scale * localTop - Number(frame.top);
+    }
+    if (solution) solution.bottomOpenWeight = bottomOpenWeight;
     return solution;
 }
 
 function objectPlacementCost(subject, frame) {
-    // Lower is better. There is deliberately no hard portrait/landscape rule:
-    // a frame of the opposite orientation may win when the detected object fits
-    // it more naturally. The score measures the composition produced by the real
-    // placement solver, not the orientation of the source photograph.
     var solution = getObjectPlacementSolution(subject, frame);
-    if (!solution) return 1000000;
+    return solution ? placementCompositionCost(solution, frame) : 1000000;
+}
 
+function placementCompositionCost(solution, frame) {
+    // One continuous score for every placement, with no branch-name penalty.
+    // Fill uses the visible bbox intersection with the requested inner frame;
+    // crop uses the full frame, so configured margins do not count as cropping.
     var scale = Number(solution.scale),
-        frameW = Number(frame.width),
-        frameH = Number(frame.height),
-        objectW = Number(subject.width) * scale,
-        objectH = Number(subject.height) * scale,
-        innerW = Math.max(0.000001, Number(solution.innerW)),
-        innerH = Math.max(0.000001, Number(solution.innerH)),
-        ratioCost = Math.abs(Math.log((objectW / objectH) / (innerW / innerH))),
-        objectLeft = Number(solution.tx) + scale * Number(solution.localLeft),
-        objectTop = Number(solution.ty) + scale * Number(solution.localTop),
-        objectRight = Number(solution.tx) + scale * Number(solution.localRight),
-        objectBottom = Number(solution.ty) + scale * Number(solution.localBottom);
+        fw = Math.max(0.000001, Number(frame.width)),
+        fh = Math.max(0.000001, Number(frame.height)),
+        left = Number(solution.tx) + scale * Number(solution.localLeft),
+        right = Number(solution.tx) + scale * Number(solution.localRight),
+        top = Number(solution.ty) + scale * Number(solution.localTop),
+        bottom = Number(solution.ty) + scale * Number(solution.localBottom),
+        ow = Math.max(0.000001, right - left),
+        oh = Math.max(0.000001, bottom - top),
+        il = Number(frame.left) + Number(solution.desiredSide),
+        ir = Number(frame.right) - Number(solution.desiredSide),
+        it = Number(frame.top) + Number(solution.desiredTop),
+        ib = Number(frame.bottom) - Number(solution.desiredBottom),
+        innerArea = Math.max(0.000001, (ir - il) * (ib - it)),
+        filledArea = Math.max(0, Math.min(right, ir) - Math.max(left, il)) *
+            Math.max(0, Math.min(bottom, ib) - Math.max(top, it)),
+        visibleArea = Math.max(0, Math.min(right, Number(frame.right)) - Math.max(left, Number(frame.left))) *
+            Math.max(0, Math.min(bottom, Number(frame.bottom)) - Math.max(top, Number(frame.top))),
+        emptyFraction = 1 - Math.min(1, filledArea / innerArea),
+        cropFraction = 1 - Math.min(1, visibleArea / (ow * oh)),
+        centerX = Number(solution.tx) + scale * Number(solution.visualCenterLocalX),
+        dx = Math.abs(centerX - Number(frame.center.x)) / fw,
+        // A vertically oversized/open figure is anchored at its top. Fade out
+        // the whole-object Y-center preference as vertical overflow increases.
+        verticalOverflow = Math.max(0, Math.min(1, (oh - (ib - it)) / Math.max(0.000001, ib - it))),
+        openWeight = Math.max(Number(solution.bottomOpenWeight) || 0, verticalOverflow),
+        dy = Math.abs((top + bottom) / 2 - (it + ib) / 2) / fh,
+        topLoss = Math.max(0, it - top) / fh,
+        bottomLoss = Math.max(0, bottom - ib) / fh * (1 - openWeight);
 
-    if (!solution.oversized) {
-        var preferredCenterX = Number(frame.center.x),
-            preferredCenterY = Number(frame.top) + Number(solution.desiredTop) + innerH / 2,
-            actualCenterX = Number(solution.tx) + scale * Number(solution.visualCenterLocalX),
-            actualCenterY = (objectTop + objectBottom) / 2,
-            centerDx = Math.abs(actualCenterX - preferredCenterX) / Math.max(1, frameW),
-            centerDy = Math.abs(actualCenterY - preferredCenterY) / Math.max(1, frameH);
-
-        // Ratio describes how completely the object fills the usable rectangle;
-        // center shift penalizes pairs where insufficient image around the object
-        // would force the final composition away from the requested center.
-        return ratioCost * 4 + (centerDx + centerDy) * 8;
-    }
-
-    var ix1 = Math.max(Number(frame.left), objectLeft),
-        iy1 = Math.max(Number(frame.top), objectTop),
-        ix2 = Math.min(Number(frame.right), objectRight),
-        iy2 = Math.min(Number(frame.bottom), objectBottom),
-        visibleArea = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1),
-        objectArea = Math.max(0.000001, objectW * objectH),
-        cropFraction = 1 - Math.min(1, visibleArea / objectArea),
-        topLoss = Math.max(0, Number(solution.desiredTop) - Number(solution.topMargin || 0)) / Math.max(1, frameH);
-
-    // Oversized placement is normal and valid, but a centered full-object fit is
-    // preferred when quality is otherwise similar. Among oversized choices,
-    // prefer less object cropping and better preservation of the requested top gap.
-    return 2 + ratioCost * 4 + cropFraction * 8 + topLoss * 4;
+    // Cropping is more costly than unused space; horizontal centering outranks
+    // vertical centering. Bottom margin remains preferred for complete figures.
+    return emptyFraction * 4 + cropFraction * 12 + dx * 8 +
+        dy * (1 - openWeight) * 3 + topLoss * 4 + bottomLoss * 4;
 }
 
 function alignLayer(subject, frame) {
@@ -1938,8 +1915,8 @@ function alignLayer(subject, frame) {
 
     if (solution.oversized) {
         // Portraits and groups that cannot be fully contained are enlarged from
-        // their top-center. The whole detected group therefore stays centered
-        // horizontally while the top of the group remains the vertical anchor.
+        // their top-center. The solved target preserves the top anchor and
+        // the closest feasible horizontal center without excessive enlargement.
         anchorX = isFiniteNumber(Number(subject.visualCenterX)) ? Number(subject.visualCenterX) : (Number(subject.left) + Number(subject.right)) / 2;
         anchorY = Number(subject.top);
         targetX = Number(solution.tx) + scale * ((anchorX - Number(layer.left)));
