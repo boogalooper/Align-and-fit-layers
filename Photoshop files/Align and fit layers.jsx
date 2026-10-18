@@ -17,7 +17,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.5.41',
+var SCRIPT_VERSION = '0.5.43',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
@@ -37,7 +37,6 @@ var SCRIPT_VERSION = '0.5.41',
     API_POLL_SLEEP = 5,
     lr = new AM('layer'),
     doc = new AM('document'),
-    previousLayer = new AM('layer', 'backwardEnum'),
     apl = new AM('application'),
     str = new Locale(),
     cfg = new Config(),
@@ -117,8 +116,45 @@ function runScript() {
     var runError = null;
     try {
         cleanupStaleTempFiles();
-        runCtx = createRunContext();
+        app.doProgressSegmentTask(10, 0, 100, 'prepareRunContextStage();');
 
+        app.doProgressSegmentTask(90, 10, 100, 'runPreparedStages();');
+        app.changeProgressText(L(str.done));
+        app.updateProgress(100, 100);
+    } catch (e) {
+        runError = e;
+        // Never leave a partly aligned document after an error or ESC.
+        // Restoring history here is safe because no further transforms are run.
+        try {
+            if (runCtx && runCtx.sourceDoc && runCtx.startHistoryState) {
+                app.activeDocument = runCtx.sourceDoc;
+                runCtx.sourceDoc.activeHistoryState = runCtx.startHistoryState;
+            }
+        } catch (historyRestoreError) { }
+    } finally {
+        try {
+            if (runCtx && runCtx.selectionModeChanged && runCtx.originalSelectionMode) {
+                doc.setSelectionMode(runCtx.originalSelectionMode);
+            }
+        } catch (restoreModeError) { }
+        try { if (runCtx && runCtx.tempFiles) cleanupTempFiles(runCtx.tempFiles); } catch (cleanupError) { }
+        try { if (runCtx && runCtx.sourceDoc) app.activeDocument = runCtx.sourceDoc; } catch (docError) { }
+        try { if (runCtx && runCtx.targetIds) reselectLayers(runCtx.targetIds); } catch (selectError) { }
+    }
+    if (runError) throw runError;
+}
+
+function prepareRunContextStage() {
+    app.changeProgressText(L(str.prepareLayers));
+    runCtx = createRunContext();
+    preparationProgress(100, 100);
+}
+
+function preparationProgress(value, total) {
+    if (app.updateProgress(value, total) === false) throw makeUserCancelError();
+}
+
+function runPreparedStages() {
         if (cfg.engine == 'python') {
             app.changeProgressText(L(str.startPython));
             afApi = new analysisApi(API_HOST, API_PORT_SEND, API_PORT_LISTEN, apiFile, runtimeInfo);
@@ -151,29 +187,6 @@ function runScript() {
         }
 
         runCtx.sourceDoc.suspendHistory('Align and fit layers', 'mainHistory();');
-        app.changeProgressText(L(str.done));
-        app.updateProgress(100, 100);
-    } catch (e) {
-        runError = e;
-        // Never leave a partly aligned document after an error or ESC.
-        // Restoring history here is safe because no further transforms are run.
-        try {
-            if (runCtx && runCtx.sourceDoc && runCtx.startHistoryState) {
-                app.activeDocument = runCtx.sourceDoc;
-                runCtx.sourceDoc.activeHistoryState = runCtx.startHistoryState;
-            }
-        } catch (historyRestoreError) { }
-    } finally {
-        try {
-            if (runCtx && runCtx.selectionModeChanged && runCtx.originalSelectionMode) {
-                doc.setSelectionMode(runCtx.originalSelectionMode);
-            }
-        } catch (restoreModeError) { }
-        try { if (runCtx && runCtx.tempFiles) cleanupTempFiles(runCtx.tempFiles); } catch (cleanupError) { }
-        try { if (runCtx && runCtx.sourceDoc) app.activeDocument = runCtx.sourceDoc; } catch (docError) { }
-        try { if (runCtx && runCtx.targetIds) reselectLayers(runCtx.targetIds); } catch (selectError) { }
-    }
-    if (runError) throw runError;
 }
 
 function createRunContext() {
@@ -181,7 +194,8 @@ function createRunContext() {
         targetList = doc.getProperty('targetLayersIDs'),
         targetIds = [],
         layerMeta = {},
-        tempFiles = [];
+        tempFiles = [],
+        metadata = new LayerMetadataCache();
 
     for (var ti = 0; ti < targetList.count; ti++) {
         targetIds.push(targetList.getReference(ti).getIdentifier('layerID'));
@@ -190,15 +204,16 @@ function createRunContext() {
 
     var clippedAtStart = 0;
     for (var mi = 0; mi < targetIds.length; mi++) {
-        var mid = targetIds[mi],
-            isClipped = !!lr.getProperty('group', false, mid);
+        var mid = targetIds[mi], info = metadata.byId(mid),
+            isClipped = info.clipped;
         layerMeta[String(mid)] = {
-            name: lr.getProperty('name', false, mid),
-            color: lr.getProperty('color', false, mid)[1],
+            name: info.name,
+            color: info.color,
             clipped: isClipped,
             clippingBaseId: null
         };
         if (isClipped) clippedAtStart++;
+        preparationProgress(30 * (mi + 1), 100 * targetIds.length);
     }
 
     var allClippedAtStart = targetIds.length > 0 && clippedAtStart == targetIds.length,
@@ -214,11 +229,11 @@ function createRunContext() {
         // Existing clipping structure is authoritative only when every selected
         // layer was clipped at script start.
         for (var ci = 0; ci < targetIds.length; ci++) {
-            var cid = targetIds[ci], baseId = findClippingBaseId(cid);
+            var cid = targetIds[ci], baseId = metadata.clippingBase(cid);
             if (!baseId) throw new Error('Cannot find clipping base for layer: ' + layerMeta[String(cid)].name);
             layerMeta[String(cid)].clippingBaseId = baseId;
+            preparationProgress(30 + 70 * (ci + 1) / targetIds.length, 100);
         }
-        reselectLayers(targetIds);
     } else {
         // Decide normal-vs-fallback BEFORE object detection. This prevents the
         // common-reference layer from being unnecessarily analyzed as a subject.
@@ -230,10 +245,12 @@ function createRunContext() {
             subjectCounts[sc] = (subjectCounts[sc] || 0) + 1;
         }
         for (var li = from; li <= len; li++) {
-            if (lr.getProperty('layerSection', false, li, true)[1] == 'layerSectionEnd') continue;
-            var lid = lr.getProperty('layerID', false, li, true);
+            var info = metadata.byIndex(li);
+            preparationProgress(30 + 70 * (li - from + 1) / Math.max(1, len - from + 1), 100);
+            if (info.section == 'layerSectionEnd') continue;
+            var lid = info.id;
             if (selectedSet[String(lid)]) continue;
-            var lc = lr.getProperty('color', false, li, true)[1];
+            var lc = info.color;
             if (lc == 'none') continue;
             if (!plannedFrameColors[lc]) plannedFrameColors[lc] = [];
             plannedFrameColors[lc].push(lid);
@@ -254,7 +271,7 @@ function createRunContext() {
 
         if (targetIds.length > 1 && matchable * 2 < targetIds.length) {
             selectedFallback = true;
-            fallbackFrameId = getBottomMostSelectedLayerId(targetIds);
+            fallbackFrameId = getBottomMostSelectedLayerId(targetIds, metadata);
             if (!fallbackFrameId) throw new Error(L(str.errFallbackFrame));
             // Fallback uses the bottom selected layer as a new common frame.
             // If that layer is already clipped, its role is ambiguous and the
@@ -644,31 +661,59 @@ function subjectFromLayerBounds(id) {
     return subject;
 }
 
-function findClippingBaseId(id) {
-    // Follow the real clipping chain downward. The first layer that is not
-    // clipped is the base layer for this clipping group. Using backwardEnum
-    // avoids assumptions about Photoshop itemIndex direction/background offsets.
-    var currentId = id, guard = 0;
-    try {
-        lr.selectLayer(currentId, false);
-        while (guard++ < 1000) {
-            var belowId = previousLayer.getProperty('layerID');
-            if (!belowId || String(belowId) == String(currentId)) return null;
-            if (!lr.getProperty('group', false, belowId)) return belowId;
-            currentId = belowId;
-            lr.selectLayer(currentId, false);
+// Short-lived snapshot: never reused after layer transforms/reordering.
+function LayerMetadataCache() {
+    var ids = {}, indices = {}, bases = {}, self = this;
+    function read(id, index) {
+        var r = new ActionReference(), s2t = stringIDToTypeID;
+        if (id != undefined) r.putIdentifier(s2t('layer'), id);
+        else r.putIndex(s2t('layer'), index);
+        var d = executeActionGet(r), section = typeIDToStringID(d.getEnumerationValue(s2t('layerSection')));
+        var info = { section: section };
+        // End markers are not real layers and must not enter the ID cache.
+        if (section != 'layerSectionEnd') {
+            info.id = d.getInteger(s2t('layerID'));
+            info.name = d.getString(s2t('name'));
+            info.color = typeIDToStringID(d.getEnumerationValue(s2t('color')));
+            info.clipped = d.getBoolean(s2t('group'));
+            info.index = d.getInteger(s2t('itemIndex')) - backgroundOffset;
+            ids[String(info.id)] = info;
+            indices[String(info.index)] = info;
         }
-    } catch (e) { }
-    return null;
+        if (index != undefined) indices[String(index)] = info;
+        return info;
+    }
+    this.byId = function (id) { return ids[String(id)] || read(id); };
+    this.byIndex = function (index) { return indices[String(index)] || read(undefined, index); };
+    this.clippingBase = function (id) {
+        var path = [], current = self.byId(id), base = null;
+        while (current && current.clipped) {
+            if (bases[String(current.id)] != undefined) { base = bases[String(current.id)]; break; }
+            path.push(current.id);
+            var index = current.index - 1;
+            if (index < minimumIndex) break;
+            current = self.byIndex(index);
+            // Closing group markers have no selectable layer ID.
+            while (current.section == 'layerSectionEnd' && --index >= minimumIndex) {
+                current = self.byIndex(index);
+            }
+            if (current.section == 'layerSectionEnd') { current = null; break; }
+        }
+        if (current && !current.clipped && current.id != undefined) base = current.id;
+        for (var i = 0; i < path.length; i++) bases[String(path[i])] = base;
+        return base;
+    };
+    var backgroundOffset = doc.getProperty('hasBackgroundLayer') ? 1 : 0,
+        minimumIndex = backgroundOffset ? 0 : 1;
 }
 
-function getBottomMostSelectedLayerId(ids) {
+function getBottomMostSelectedLayerId(ids, metadata) {
     // Photoshop itemIndex grows from the bottom of the layer stack upward
     // (background is 0/1 depending on document structure), so the smallest
     // itemIndex is the bottom-most selected layer.
     var bestId = null, bestIndex = Infinity;
     for (var i = 0; i < ids.length; i++) {
-        var idx = Number(lr.getProperty('itemIndex', false, ids[i]));
+        var idx = metadata.byId(ids[i]).index;
         if (idx < bestIndex) {
             bestIndex = idx;
             bestId = ids[i];
@@ -711,10 +756,14 @@ function readFramesStage() {
 
 function readFrameChunk(i) {
     var id = runCtx.frames[i],
-        frameName = lr.getProperty('name', false, id),
+        descriptor = lr.getDescriptor(id),
+        frameName = descriptor.getString(stringIDToTypeID('name')),
         text = L(str.readFrames) + ': ' + (i + 1) + '/' + runCtx.frames.length + ' — ' + frameName;
 
-    doc.makeSelection(id, lr.getProperty('hasVectorMask', false, id) && !(lr.hasProperty('vectorMaskEmpty', id) ? lr.getProperty('vectorMaskEmpty', false, id) : true));
+    var maskKey = stringIDToTypeID('hasVectorMask'),
+        emptyKey = stringIDToTypeID('vectorMaskEmpty'),
+        useVectorMask = descriptor.getBoolean(maskKey) && descriptor.hasKey(emptyKey) && !descriptor.getBoolean(emptyKey);
+    doc.makeSelection(id, useVectorMask);
     doc.setQuickMask(true);
     doc.levels([128, 1, 240]);
     doc.setQuickMask();
@@ -731,8 +780,8 @@ function readFrameChunk(i) {
         frame.ratio = width / height;
         frame.area = width * height;
     }
-    frame.color = lr.getProperty('color', false, id)[1];
-    frame.id = lr.getProperty('layerID', false, id);
+    frame.color = typeIDToStringID(descriptor.getEnumerationValue(stringIDToTypeID('color')));
+    frame.id = id;
     runCtx.frames[i] = frame;
     app.changeProgressText(text);
     $.sleep(0);
@@ -812,7 +861,7 @@ function alignSubjectsStage() {
 
 function alignSubjectChunk(i) {
     var subject = runCtx.subjects[i],
-        layerName = lr.getProperty('name', false, subject.id),
+        layerName = runCtx.layerMeta[String(subject.id)].name,
         text = L(str.align) + ': ' + (i + 1) + '/' + runCtx.subjects.length + ' — ' + layerName,
         frame = null;
 
@@ -1238,6 +1287,7 @@ function Config() {
     };
 }
 function Locale() {
+    this.prepareLayers = { ru: 'Подготовка слоёв...', en: 'Preparing layers...' };
     this.title = { ru: 'Выравнивание и вписывание', en: 'Align and fit layers' };
     this.err = { ru: 'Скрипт остановлен', en: 'Script stopped' };
     this.errDoc = { ru: 'Нет активного документа!', en: 'No active document!' };
@@ -1427,7 +1477,22 @@ function openActiveSmartObjectContents() {
 
 function reselectLayers(ids) {
     if (!ids || !ids.length) return;
-    // First selection replaces the current layer selection; the rest are added.
+    if (ids.length > 2) {
+        try {
+            // Bulk-select all except the final ID. Select that ID separately so
+            // the active layer is identical to the former sequential loop.
+            var r = new ActionReference(), d = new ActionDescriptor(), s2t = stringIDToTypeID;
+            for (var j = 0; j < ids.length - 1; j++) r.putIdentifier(s2t('layer'), ids[j]);
+            d.putReference(s2t('null'), r);
+            d.putBoolean(s2t('makeVisible'), false);
+            executeAction(s2t('select'), d, DialogModes.NO);
+            lr.selectLayer(ids[ids.length - 1], true);
+            return;
+        } catch (e) {
+            if (e.number == 8007) throw e;
+            // Compatibility fallback resets any partially changed selection.
+        }
+    }
     lr.selectLayer(ids[0], false);
     for (var i = 1; i < ids.length; i++) lr.selectLayer(ids[i], true);
 }
@@ -1940,6 +2005,11 @@ function AM(target, order) {
     var s2t = stringIDToTypeID,
         t2s = typeIDToStringID;
     target = s2t(target)
+    this.getDescriptor = function (id) {
+        var reference = new ActionReference();
+        reference.putIdentifier(target, id);
+        return executeActionGet(reference);
+    };
     this.getProperty = function (property, descMode, id, idxMode) {
         property = s2t(property);
         (r = new ActionReference()).putProperty(s2t('property'), property);
