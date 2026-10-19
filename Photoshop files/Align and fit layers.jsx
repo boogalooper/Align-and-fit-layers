@@ -17,7 +17,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.5.43',
+var SCRIPT_VERSION = '0.5.44',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
@@ -141,6 +141,7 @@ function runScript() {
         try { if (runCtx && runCtx.sourceDoc) app.activeDocument = runCtx.sourceDoc; } catch (docError) { }
         try { if (runCtx && runCtx.targetIds) reselectLayers(runCtx.targetIds); } catch (selectError) { }
     }
+    if (runCtx) runCtx.placementSolutions = null;
     if (runError) throw runError;
 }
 
@@ -310,6 +311,8 @@ function createRunContext() {
         analysisMap: {},
         subjects: [],
         frames: [],
+        framesById: {},
+        placementSolutions: null,
         plannedFrames: plannedFrames,
         assignments: null,
         selectedFallback: selectedFallback,
@@ -570,32 +573,41 @@ function collectSubjectChunk(i) {
         text = L(str.detectBounds) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' — ' + layerName;
 
     doc.selectLayer(id);
-    if (!lr.getProperty('visible')) lr.setLayerVisiblity(id, true);
+    // Read live bounds only after preview history has been restored.
+    var descriptor = lr.getDescriptor(id), layerBounds;
+    if (!descriptor.getBoolean(stringIDToTypeID('visible'))) {
+        lr.setLayerVisiblity(id, true);
+        // Visibility changes can affect group bounds: read them after the change.
+        layerBounds = doc.descToObject(lr.getProperty('boundsNoEffects', false, id));
+    } else {
+        layerBounds = doc.descToObject(descriptor.getObjectValue(stringIDToTypeID('boundsNoEffects')));
+    }
+    descriptor = null;
 
     var subject = null;
     if (cfg.engine == 'python') {
         var analysis = runCtx.analysisMap[String(id)];
         if (!analysis) throw new Error('Python returned no result for layer: ' + layerName);
         if (!analysis.error && analysis.bbox && analysis.width && analysis.height) {
-            subject = subjectFromLocalAnalysis(id, analysis, true);
+            subject = subjectFromLocalAnalysis(id, analysis, true, layerBounds);
         }
         // Detection failure is local to this photo. Use complete layer bounds for
         // this one subject, while all other photos keep the selected Python mode.
         if (!subject) {
-            subject = subjectFromLayerBounds(id);
+            subject = subjectFromLayerBounds(id, layerBounds);
             if (!subject) throw new Error(L(str.errLayerBounds) + ': ' + layerName);
         }
     } else if (cfg.engine == 'device' || cfg.engine == 'cloud') {
         var measured = runCtx.analysisMap[String(id)];
-        subject = subjectFromLocalAnalysis(id, measured, false);
+        subject = subjectFromLocalAnalysis(id, measured, false, layerBounds);
         // Select Subject returning no usable object is also a per-layer fallback,
         // not a reason to switch or abort the complete batch.
         if (!subject) {
-            subject = subjectFromLayerBounds(id);
+            subject = subjectFromLayerBounds(id, layerBounds);
             if (!subject) throw new Error(L(str.errLayerBounds) + ': ' + layerName);
         }
     } else {
-        subject = subjectFromLayerBounds(id);
+        subject = subjectFromLayerBounds(id, layerBounds);
         if (!subject) throw new Error(L(str.errLayerBounds) + ': ' + layerName);
     }
 
@@ -606,14 +618,14 @@ function collectSubjectChunk(i) {
     $.sleep(0);
 }
 
-function subjectFromLocalAnalysis(id, analysis, fromPython) {
+function subjectFromLocalAnalysis(id, analysis, fromPython, layerBounds) {
     try {
         if (!analysis || !analysis.bbox || !analysis.width || !analysis.height) return null;
 
         // Python previews and Photoshop Select Subject are both measured in the
         // temporary Smart Object's local coordinate system. Re-read live restored
         // layer bounds and map that local rectangle back to document coordinates.
-        var layerBounds = doc.descToObject(lr.getProperty('boundsNoEffects', false, id));
+        if (!layerBounds) layerBounds = doc.descToObject(lr.getProperty('boundsNoEffects', false, id));
         if (!layerBounds || !(Number(layerBounds.width) > 0) || !(Number(layerBounds.height) > 0)) return null;
         var sx = Number(layerBounds.width) / Number(analysis.width),
             sy = Number(layerBounds.height) / Number(analysis.height),
@@ -644,8 +656,8 @@ function subjectFromLocalAnalysis(id, analysis, fromPython) {
     }
 }
 
-function subjectFromLayerBounds(id) {
-    var b = doc.descToObject(lr.getProperty('boundsNoEffects', false, id));
+function subjectFromLayerBounds(id, layerBounds) {
+    var b = layerBounds || doc.descToObject(lr.getProperty('boundsNoEffects', false, id));
     if (!b || !(Number(b.width) > 0) || !(Number(b.height) > 0)) return null;
     var subject = {
         top: Number(b.top), left: Number(b.left), right: Number(b.right), bottom: Number(b.bottom),
@@ -783,12 +795,15 @@ function readFrameChunk(i) {
     frame.color = typeIDToStringID(descriptor.getEnumerationValue(stringIDToTypeID('color')));
     frame.id = id;
     runCtx.frames[i] = frame;
+    runCtx.framesById[String(frame.id)] = frame;
     app.changeProgressText(text);
     $.sleep(0);
 }
 
 function matchFramesStage() {
     app.changeProgressText(L(str.matchFrames));
+    // Geometry and settings remain fixed from matching through alignment.
+    runCtx.placementSolutions = {};
     if (runCtx.selectedFallback || runCtx.allClippedAtStart) {
         runCtx.assignments = null;
         return;
@@ -870,7 +885,7 @@ function alignSubjectChunk(i) {
         // own real clipping-base frame; colors and global matching are irrelevant.
         var meta = runCtx.layerMeta[String(subject.id)],
             baseId = meta ? meta.clippingBaseId : null;
-        frame = baseId ? findFrameById(runCtx.frames, baseId) : null;
+        frame = baseId ? runCtx.framesById[String(baseId)] : null;
         if (!frame) throw new Error('Cannot read clipping-base frame for layer: ' + layerName);
         lr.selectLayer(subject.id);
         if (usesLayerBoundsPlacement(subject)) alignLayerBounds(subject, frame); else alignLayer(subject, frame);
@@ -878,7 +893,7 @@ function alignSubjectChunk(i) {
         if (runCtx.selectedFallback) {
             frame = runCtx.frames.length ? runCtx.frames[0] : null;
         } else if (runCtx.assignments && runCtx.assignments[String(subject.id)] != undefined) {
-            frame = findFrameById(runCtx.frames, runCtx.assignments[String(subject.id)]);
+            frame = runCtx.framesById[String(runCtx.assignments[String(subject.id)])];
         }
         // In the user-approved shortage case, an unmatched layer deliberately
         // stays exactly where it was. Fallback is alignment-only: the common
@@ -1520,14 +1535,6 @@ function cleanupStaleTempFiles() {
 }
 
 
-function findFrameById(frames, id) {
-    for (var i = 0; i < frames.length; i++) {
-        if (String(frames[i].id) == String(id)) return frames[i];
-    }
-    return null;
-}
-
-
 function alignLayerBounds(subject, frame) {
     // Dedicated Cover mode: center the complete layer in the frame and scale it
     // just enough to cover the frame in both dimensions. Object margins/offsets
@@ -1554,6 +1561,19 @@ function alignLayerBounds(subject, frame) {
 }
 
 function getObjectPlacementSolution(subject, frame) {
+    // Cache is scoped to matching/alignment of this run, never to live bounds.
+    var cache = runCtx && runCtx.placementSolutions;
+    if (!cache || subject.id == undefined || frame.id == undefined) {
+        return calculateObjectPlacementSolution(subject, frame);
+    }
+    var key = String(subject.id) + ':' + String(frame.id), entry = cache[key];
+    if (entry) return entry.solution;
+    var solution = calculateObjectPlacementSolution(subject, frame);
+    cache[key] = { solution: solution };
+    return solution;
+}
+
+function calculateObjectPlacementSolution(subject, frame) {
     // Pure geometry shared by both matching and the final transform. Matching a
     // photo to a frame therefore evaluates the same composition that will later
     // be applied in Photoshop.
