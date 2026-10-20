@@ -1,11 +1,11 @@
-# Исходник иллюстрации портретного режима
+# Иллюстрация портретного режима
 
-`portrait-preview.png`: 160 × 240, индексированный PNG, 128 цветов с прозрачностью; 7014 байт. Его бинарная копия встроена в JSX. В Photoshop копировать папку assets не требуется.
+`portrait-preview.png`: 160 × 240, индексированный PNG, 128 цветов с прозрачностью; 6193 байта. Его бинарная копия встроена в JSX. В Photoshop копировать папку assets не требуется.
 
-Иллюстрация создана встроенным генератором изображений, затем уменьшена и оптимизирована для небольшого окна ScriptUI. Исходные большие изображения в выпуск не включены.
+Иллюстрация создана встроенным генератором изображений, затем уменьшена и оптимизирована. Большой исходник в выпуск не включён.
 
-Координаты для поясняющей схемы: середина глаз (80, 32), подбородок (80, 51), верх причёски (80, 4). Эти ориентиры относятся только к иллюстрации; они не заменяют измерения реальных фотографий.
+Ориентиры поясняющей схемы: середина глаз (80, 32), подбородок (80, 52), верх короткой причёски (80, 7). Они относятся только к иллюстрации, а не к анализу выбранных фотографий.
 
-Финальный запрос генератору (редактирование предварительной иллюстрации):
+Запрос генератору:
 
-> Edit this asset for a tiny desktop UI illustration. Keep this same woman, face, teal sweater, trousers, front pose and composition. Remove ALL surrounding glow, halo, colored haze and shadow completely, leaving ONLY the clean outlined person against fully transparent alpha background. Frame her from top of hair to just below knees, NOT down to calves/ankles: the bottom should terminate just below the knees, keep full head and hands visible with a small transparent margin on all sides. Simplify shading and textures to clean flat colors so it reads at 200 pixels tall. No text, no decorative marks, no background. Actual transparent cutout, no checkerboard drawn into image.
+> Use case: stylized-concept. Asset: small portrait-framing preview for Photoshop settings. ONE boy around 10–12 years old, front view, standing upright with arms relaxed straight down, shown from the very top of his head to just below his knees. Clean friendly editorial illustration with simple shapes, sparse flat shading and crisp edges, not photorealistic and not a featureless stick figure. Short neat close-cropped brown hair following the skull closely, very little hair volume, no quiff, no curls, no bangs, no hat. Upright head, level eyes looking straight forward, natural neutral face. Muted teal plain long-sleeve shirt and dark slate trousers, no logos, no accessories or text. Narrow vertical composition with figure centered and small transparent padding on all sides; hands and knees visible. Fully transparent background with no environment, no halo, no glow, no ground or shadow. Must read clearly at only 160 x 240 pixels. Hair silhouette must make the anatomical top of the head obvious.
