@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate and build ZIP
+        id: build
+        shell: python
+        run: |
+          import ast
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import zipfile
+
+          root = Path.cwd()
+          jsx = root / 'Photoshop files/Align and fit layers.jsx'
+          api = root / 'Photoshop files/lib/align-fit-api.pyw'
+          source = jsx.read_text(encoding='utf-8-sig')
+          api_source = api.read_text(encoding='utf-8-sig')
+
+          def constant(text, name):
+              match = re.search(r'\b' + name + r'''\s*=\s*['"]([^'"]+)['"]''', text)
+              if not match:
+                  raise RuntimeError(f'Missing {name}')
+              return match.group(1)
+
+          version = constant(source, 'SCRIPT_VERSION')
+          if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              raise RuntimeError(f'Invalid SCRIPT_VERSION: {version}')
+          tag = 'v' + version
+          if os.environ.get('GITHUB_REF_TYPE') == 'tag' and os.environ['GITHUB_REF_NAME'] != tag:
+              raise RuntimeError(f'Tag must match SCRIPT_VERSION: {tag}')
+          if constant(source, 'EXPECTED_SERVER_VERSION') != constant(api_source, 'SERVER_VERSION'):
+              raise RuntimeError('JSX and Python server protocol versions differ')
+
+          # A manual run must never publish another commit under an existing tag.
+          existing = subprocess.run(
+              ['git', 'rev-parse', '--verify', '--quiet', f'refs/tags/{tag}^{{commit}}'],
+              capture_output=True, text=True,
+          )
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if existing.returncode == 0 and existing.stdout.strip() != head:
+              raise RuntimeError(f'{tag} already points to another commit')
+          if existing.returncode not in (0, 1):
+              raise RuntimeError('Cannot check the release tag')
+
+          # Syntax checks do not import Python modules or start Photoshop/models.
+          ast.parse(api_source, filename=str(api))
+          js = re.sub(r'^\s*#(?:target|targetengine)\b[^\n]*', '', source, flags=re.M)
+          subprocess.run(
+              ['node', '-e', 'new (require("vm").Script)(require("fs").readFileSync(0,"utf8"));'],
+              input=js, text=True, check=True,
+          )
+
+          files = [jsx, api, root / 'install_runtime.bat', root / 'README.md']
+          assets = root / 'assets'
+          files.extend(sorted(p for p in assets.iterdir() if p.is_file()))
+          for path in files:
+              if not path.is_file() or path.is_symlink():
+                  raise RuntimeError(f'Missing or unsupported release file: {path}')
+
+          output = root / 'dist' / f'Align-and-fit-layers-{tag}.zip'
+          output.parent.mkdir(exist_ok=True)
+          with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED, allowZip64=False) as archive:
+              for path in files:
+                  data = path.read_bytes()
+                  if path.suffix.lower() == '.bat':
+                      if data.startswith(b'\xef\xbb\xbf'):
+                          raise RuntimeError(f'BAT must not have a UTF-8 BOM: {path}')
+                      data = data.replace(b'\r\n', b'\n').replace(b'\n', b'\r\n')
+                  entry = zipfile.ZipInfo(path.relative_to(root).as_posix())
+                  entry.compress_type = zipfile.ZIP_DEFLATED
+                  entry.create_system = 0
+                  entry.external_attr = 0x20
+                  archive.writestr(entry, data)
+          with zipfile.ZipFile(output) as archive:
+              if archive.testzip() is not None:
+                  raise RuntimeError('ZIP validation failed')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as stream:
+              stream.write(f'tag={tag}\narchive={output.relative_to(root).as_posix()}\n')
+          print(f'Built {output.name}: {output.stat().st_size:,} bytes, {len(files)} files')
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.build.outputs.tag }}
+          RELEASE_ARCHIVE: ${{ steps.build.outputs.archive }}
+        shell: bash
+        run: |
+          gh release create "$RELEASE_TAG" "$RELEASE_ARCHIVE" \
+            --target "$GITHUB_SHA" \
+            --title "Align and fit layers $RELEASE_TAG" \
+            --generate-notes
