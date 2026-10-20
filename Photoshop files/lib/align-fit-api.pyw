@@ -5,12 +5,14 @@ import socket
 import threading
 import time
 import sys
+from collections import OrderedDict
+from copy import deepcopy
 
 API_HOST = "127.0.0.1"
 API_PORT_SEND = 6321       # Python -> JSX
 API_PORT_LISTEN = 6320     # JSX -> Python
 TIMEOUT = 15 * 60
-SERVER_VERSION = "0.6.3"
+SERVER_VERSION = "0.6.4"
 
 # Models are installed with the private runtime, outside the Photoshop folder.
 # sys.prefix points to the active venv when the server is started by launcher.vbs.
@@ -38,6 +40,59 @@ model_lock = threading.Lock()
 model_init_lock = threading.Lock()
 _models = None
 _model_error = None
+
+# Small measurements only; no images, masks or model outputs remain in the cache.
+analysis_cache = OrderedDict()
+analysis_cache_lock = threading.Lock()
+ANALYSIS_CACHE_LIMIT = 512
+
+
+def valid_analysis_key(key):
+    return isinstance(key, str) and 0 < len(key) <= 16384
+
+
+def read_cached_analysis(key, portraits=False):
+    if not valid_analysis_key(key):
+        return None
+    with analysis_cache_lock:
+        entry = analysis_cache.get(key)
+        if entry is None or (portraits and not entry[0]):
+            return None
+        analysis_cache.move_to_end(key)
+        return deepcopy(entry[1])
+
+
+def store_cached_analysis(key, info, portraits=False):
+    if not valid_analysis_key(key) or info.get("error") or not info.get("bbox") or info.get("portrait_error"):
+        return info
+    w, h = info.get("width", 0), info.get("height", 0)
+    if not (w > 0 and h > 0):
+        return info
+    value = deepcopy(info)
+    value.pop("id", None)
+    value["bbox"] = [v / (w if i % 2 == 0 else h) for i, v in enumerate(value["bbox"])]
+    if value.get("visual_center_x") is not None:
+        value["visual_center_x"] /= w
+    p = value.get("portrait")
+    if p:
+        unit = math.sqrt(w * h)
+        p["eye"] = [p["eye"][0] / w, p["eye"][1] / h]
+        p["metrics"] = [v / unit for v in p["metrics"]]
+        p["head"] = p.get("head", 0) / unit
+        for k in ("head_top", "chin"):
+            p[k] /= h
+        for k in ("head_left", "head_right"):
+            p[k] /= w
+    value["width"], value["height"] = 1., 1.
+    with analysis_cache_lock:
+        # A plain-object request must not downgrade existing portrait measurements.
+        previous = analysis_cache.get(key)
+        if previous is None or portraits or not previous[0]:
+            analysis_cache[key] = (bool(portraits), value)
+        analysis_cache.move_to_end(key)
+        while len(analysis_cache) > ANALYSIS_CACHE_LIMIT:
+            analysis_cache.popitem(last=False)
+    return deepcopy(value)
 
 
 def _load_dependencies():
@@ -1125,8 +1180,16 @@ def handle_client(client_socket, server):
             if msg_type == "handshake":
                 get_models()
                 reply("answer", {"status": "success", "version": SERVER_VERSION, "idle_timeout": TIMEOUT})
+            elif msg_type == "analysis_cache":
+                options = payload or {}
+                entries = options.get("items") or []
+                if not isinstance(entries, list) or len(entries) > ANALYSIS_CACHE_LIMIT:
+                    raise ValueError("Invalid analysis cache request")
+                reply("answer", {"items": [{"id": v["id"], "analysis": read_cached_analysis(
+                    v.get("cache_key"), bool(options.get("portraits", False)))} for v in entries]})
             elif msg_type == "analyze":
                 items = (payload or {}).get("items") or []
+                portraits = bool((payload or {}).get("portraits", False))
                 cancel_event = threading.Event()
                 with activity_lock:
                     analysis_requests[request_id] = cancel_event
@@ -1137,8 +1200,11 @@ def handle_client(client_socket, server):
                     item_id = item.get("id")
                     path = item.get("path", "")
                     try:
-                        info = analyze_image(path, portraits=bool((payload or {}).get("portraits", False)),
-                            cancel_event=cancel_event)
+                        info = read_cached_analysis(item.get("cache_key"), portraits)
+                        if info is None:
+                            info = analyze_image(path, portraits=portraits, cancel_event=cancel_event)
+                            check_analysis_cancelled(cancel_event)
+                            info = store_cached_analysis(item.get("cache_key"), info, portraits)
                         info["id"] = item_id
                         result.append(info)
                     except AnalysisCancelled:

@@ -17,7 +17,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.7.10',
+var SCRIPT_VERSION = '0.7.12',
     SCRIPT_NAME = 'Align and fit layers',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
@@ -25,7 +25,7 @@ var SCRIPT_VERSION = '0.7.10',
     API_PORT_LISTEN = 6321,
     API_FILES = ['lib/align-fit-api.pyw', 'align-fit-api.pyw'],
     RUNTIME_NAME = 'AlignFitRuntime',
-    EXPECTED_SERVER_VERSION = '0.6.3',
+    EXPECTED_SERVER_VERSION = '0.6.4',
     PREVIEW_MAX = 1280,
     FINAL_BLEED_PX = 2,
     INIT_DELAY = 15000,
@@ -328,16 +328,57 @@ function createRunContext() {
     };
 }
 
+function prepareAnalysisCache() {
+    var ctx = runCtx, items = [], i;
+    ctx.analysisCacheKeys = {};
+    ctx.previewTargetIds = ctx.subjectTargetIds.slice(0);
+    var cache = $.global.alignFitAnalysisCache;
+    if (!cache || cache.version != SCRIPT_VERSION) {
+        cache = { version: SCRIPT_VERSION, session: String((new Date()).getTime()) + '-' + Math.random() };
+        $.global.alignFitAnalysisCache = cache;
+    }
+    var documentId = String(doc.getProperty('documentID'));
+    for (i = 0; i < ctx.subjectTargetIds.length; i++) {
+        var id = ctx.subjectTargetIds[i], meta = ctx.layerMeta[String(id)],
+            name = meta.name,
+            key = cache.session + '|' + documentId + '|' + id + '|' +
+                (meta.smartObject ? 'S' : 'R') + '|' + name.length + ':' + name;
+        ctx.analysisCacheKeys[String(id)] = key;
+        items.push({ id: id, cache_key: key });
+    }
+    // Layer identity is independent of selection and undo/redo history.
+    // One batch lookup before any preview is made. Errors fall back to analysis.
+    var result;
+    try { result = afApi.sendPayload('analysis_cache', { items: items, portraits: !!cfg.portraits }, MATCH_DELAY); }
+    catch (e) { if (e.number == 8007) throw e; return; }
+    if (!result || !result.items) return;
+    var cached = {};
+    for (i = 0; i < result.items.length; i++) {
+        var entry = result.items[i], info = entry.analysis;
+        if (info && info.bbox && info.width > 0 && info.height > 0 && !info.error)
+            cached[String(entry.id)] = info;
+    }
+    ctx.previewTargetIds = [];
+    for (i = 0; i < ctx.subjectTargetIds.length; i++) {
+        var id = ctx.subjectTargetIds[i], info = cached[String(id)];
+        if (info) ctx.analysisMap[String(id)] = info;
+        else ctx.previewTargetIds.push(id);
+    }
+}
+
 function preparePythonStage() {
     var ctx = runCtx,
         oldDialogs = app.displayDialogs;
+    prepareAnalysisCache();
+    // A full hit needs neither temporary Smart Objects nor a history rollback.
+    if (!ctx.previewTargetIds.length) return;
     try {
         // All Photoshop actions used by preview preparation are silent. Set this
         // once for the batch instead of crossing the DOM bridge for every layer.
         app.displayDialogs = DialogModes.NO;
         ctx.sourceDoc.suspendHistory('Prepare Align and Fit previews', 'preparePythonPreviewsLoop();');
-        if (!ctx.items.length || ctx.items.length != ctx.subjectTargetIds.length) {
-            throw new Error('Python preview export incomplete: ' + ctx.items.length + ' of ' + ctx.subjectTargetIds.length + ' layers.');
+        if (ctx.items.length != ctx.previewTargetIds.length) {
+            throw new Error('Python preview export incomplete: ' + ctx.items.length + ' of ' + ctx.previewTargetIds.length + ' layers.');
         }
         app.changeProgressText(L(str.restoreLayers));
         undoPreviewHistory(ctx.sourceDoc);
@@ -361,7 +402,7 @@ function preparePythonStage() {
 }
 
 function preparePythonPreviewsLoop() {
-    var n = runCtx.subjectTargetIds.length,
+    var n = runCtx.previewTargetIds.length,
         slice = 1 / Math.max(1, n);
     for (var i = 0; i < n; i++) {
         if (app.doProgressTask(slice, 'preparePythonPreviewChunk(' + i + ');') === false) throw makeUserCancelError();
@@ -369,19 +410,22 @@ function preparePythonPreviewsLoop() {
 }
 
 function preparePythonPreviewChunk(i) {
-    var id = runCtx.subjectTargetIds[i],
+    var id = runCtx.previewTargetIds[i],
         meta = runCtx.layerMeta[String(id)],
         name = meta ? meta.name : lr.getProperty('name', false, id),
-        text = L(str.prepareImages) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' — ' + name;
+        text = L(str.prepareImages) + ': ' + (i + 1) + '/' + runCtx.previewTargetIds.length + ' — ' + name;
+    app.changeProgressText(text);
+    $.sleep(0);
     app.activeDocument = runCtx.sourceDoc;
     lr.selectLayer(id);
     if (!meta.visible) lr.setLayerVisiblity(id, true);
     runCtx.previewTouched = true;
     protectTemporarySmartObjectName(id, name);
     var preview = exportLayerPreview(runCtx.sourceDoc, id, i, runCtx.tempFiles);
-    if (preview) runCtx.items.push(preview);
-    app.changeProgressText(text);
-    $.sleep(0);
+    if (preview) {
+        preview.cache_key = runCtx.analysisCacheKeys[String(id)] || null;
+        runCtx.items.push(preview);
+    }
 }
 
 function pythonAnalysisProgressChunk() {
@@ -393,13 +437,13 @@ function pythonAnalysisProgressChunk() {
 }
 
 function analyzePythonStage() {
+    if (!runCtx.items.length) return;
     app.changeProgressText(L(str.analyzePython));
     // Large selections can legitimately take longer than the fixed base timeout.
     // Keep a generous per-image allowance while capping the wait at 15 minutes.
     var analyzeDelay = Math.max(ANALYZE_DELAY, Math.min(15 * 60 * 1000, runCtx.items.length * 10000)),
         analyzed = afApi.sendPayload('analyze', { items: runCtx.items, portraits: !!cfg.portraits }, analyzeDelay, true);
     if (!analyzed || !analyzed.items) throw new Error('Python returned an invalid analysis response.');
-    runCtx.analysisMap = {};
     for (var ai = 0; ai < analyzed.items.length; ai++) {
         runCtx.analysisMap[String(analyzed.items[ai].id)] = analyzed.items[ai];
     }
@@ -446,6 +490,8 @@ function prepareAutoCutoutChunk(i) {
         meta = runCtx.layerMeta[String(id)],
         name = meta ? meta.name : lr.getProperty('name', false, id),
         text = L(str.detectBounds) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' — ' + name;
+    app.changeProgressText(text);
+    $.sleep(0);
     app.activeDocument = runCtx.sourceDoc;
     lr.selectLayer(id);
     if (!meta.visible) lr.setLayerVisiblity(id, true);
@@ -456,8 +502,6 @@ function prepareAutoCutoutChunk(i) {
     // without changing the engine for the rest of the selection.
     if (!measured) measured = { id: id, bbox: null };
     runCtx.analysisMap[String(id)] = measured;
-    app.changeProgressText(text);
-    $.sleep(0);
 }
 
 function measureAutoCutoutInSmartObject(sourceDoc, id) {
@@ -574,6 +618,8 @@ function collectSubjectChunk(i) {
         layerName = meta ? meta.name : lr.getProperty('name', false, id),
         text = L(str.detectBounds) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' — ' + layerName;
 
+    app.changeProgressText(text);
+    $.sleep(0);
     // Read live bounds only after preview history has been restored.
     var descriptor = lr.getDescriptor(id), layerBounds;
     if (!descriptor.getBoolean(stringIDToTypeID('visible'))) {
@@ -615,8 +661,6 @@ function collectSubjectChunk(i) {
     subject.color = meta ? meta.color : lr.getProperty('color', false, id)[1];
     subject.id = id;
     runCtx.subjects.push(subject);
-    app.changeProgressText(text);
-    $.sleep(0);
 }
 
 function subjectFromLocalAnalysis(id, analysis, fromPython, layerBounds) {
@@ -789,6 +833,8 @@ function readFrameChunk(i) {
         frameName = descriptor.getString(stringIDToTypeID('name')),
         text = L(str.readFrames) + ': ' + (i + 1) + '/' + runCtx.frames.length + ' — ' + frameName;
 
+    app.changeProgressText(text);
+    $.sleep(0);
     var maskKey = stringIDToTypeID('hasVectorMask'),
         emptyKey = stringIDToTypeID('vectorMaskEmpty'),
         useVectorMask = descriptor.getBoolean(maskKey) && descriptor.hasKey(emptyKey) && !descriptor.getBoolean(emptyKey);
@@ -813,8 +859,6 @@ function readFrameChunk(i) {
     frame.id = id;
     runCtx.frames[i] = frame;
     runCtx.framesById[String(frame.id)] = frame;
-    app.changeProgressText(text);
-    $.sleep(0);
 }
 
 function matchFramesStage() {
@@ -952,6 +996,8 @@ function alignSubjectChunk(i) {
         text = L(str.align) + ': ' + (i + 1) + '/' + runCtx.subjects.length + ' — ' + layerName,
         frame = null;
 
+    app.changeProgressText(text);
+    $.sleep(0);
     if (runCtx.allClippedAtStart) {
         // Preserve the user's existing clipping structure. Each subject uses its
         // own real clipping-base frame; colors and global matching are irrelevant.
@@ -975,8 +1021,6 @@ function alignSubjectChunk(i) {
             else moveAndAlignSubject(subject, frame);
         }
     }
-    app.changeProgressText(text);
-    $.sleep(0);
 }
 
 function usesLayerBoundsPlacement(subject) {
@@ -2696,8 +2740,8 @@ function analysisApi(apiHost, portSend, portListen, apiFile, runtime) {
         return String(value)
             .replace(/\\/g, '\\\\')
             .replace(/"/g, '\\"')
-            .replace(/\r/g, '\\r')
-            .replace(/\n/g, '\\n')
-            .replace(/\t/g, '\\t');
+            .replace(/[\x00-\x1f\u2028\u2029]/g, function (ch) {
+                return '\\u' + ('0000' + ch.charCodeAt(0).toString(16)).slice(-4);
+            });
     }
 }
