@@ -17,7 +17,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.7.12',
+var SCRIPT_VERSION = '0.7.13',
     SCRIPT_NAME = 'Align and fit layers',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
@@ -328,20 +328,34 @@ function createRunContext() {
     };
 }
 
+function analysisCacheSession() {
+    // The default JSX engine may be recreated between script invocations.
+    // Photoshop owns these session-only options; they are not action settings.
+    var optionsKey = UUID + '.analysisCache',
+        sessionKey = stringIDToTypeID('session'),
+        versionKey = stringIDToTypeID('version'),
+        options = null;
+    try { options = app.getCustomOptions(optionsKey); }
+    catch (e) { if (e.number == 8007) throw e; }
+    if (options && options.hasKey(sessionKey) && options.hasKey(versionKey) &&
+        options.getString(versionKey) == EXPECTED_SERVER_VERSION) return options.getString(sessionKey);
+    var session = String((new Date()).getTime()) + '-' + Math.random();
+    options = new ActionDescriptor();
+    options.putString(sessionKey, session);
+    options.putString(versionKey, EXPECTED_SERVER_VERSION);
+    app.putCustomOptions(optionsKey, options, false);
+    return session;
+}
+
 function prepareAnalysisCache() {
     var ctx = runCtx, items = [], i;
     ctx.analysisCacheKeys = {};
     ctx.previewTargetIds = ctx.subjectTargetIds.slice(0);
-    var cache = $.global.alignFitAnalysisCache;
-    if (!cache || cache.version != SCRIPT_VERSION) {
-        cache = { version: SCRIPT_VERSION, session: String((new Date()).getTime()) + '-' + Math.random() };
-        $.global.alignFitAnalysisCache = cache;
-    }
-    var documentId = String(doc.getProperty('documentID'));
+    var session = analysisCacheSession(), documentId = String(doc.getProperty('documentID'));
     for (i = 0; i < ctx.subjectTargetIds.length; i++) {
         var id = ctx.subjectTargetIds[i], meta = ctx.layerMeta[String(id)],
             name = meta.name,
-            key = cache.session + '|' + documentId + '|' + id + '|' +
+            key = session + '|' + documentId + '|' + id + '|' +
                 (meta.smartObject ? 'S' : 'R') + '|' + name.length + ':' + name;
         ctx.analysisCacheKeys[String(id)] = key;
         items.push({ id: id, cache_key: key });
