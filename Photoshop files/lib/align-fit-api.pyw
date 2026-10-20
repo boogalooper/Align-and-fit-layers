@@ -10,7 +10,7 @@ API_HOST = "127.0.0.1"
 API_PORT_SEND = 6321       # Python -> JSX
 API_PORT_LISTEN = 6320     # JSX -> Python
 TIMEOUT = 15 * 60
-SERVER_VERSION = "0.5.1"
+SERVER_VERSION = "0.6.0"
 
 # Models are installed with the private runtime, outside the Photoshop folder.
 # sys.prefix points to the active venv when the server is started by launcher.vbs.
@@ -600,7 +600,7 @@ def _choose_portrait(domain, q, e):
     q = max(lo, min(hi, q))
     elo = max(a*q+b for a, b in lower)
     ehi = min(a*q+b for a, b in upper)
-    return q, max(elo, min(ehi, e))
+    return q, elo if e is None else max(elo, min(ehi, e))
 
 
 def solve_portrait_layout(payload):
@@ -645,7 +645,10 @@ def solve_portrait_layout(payload):
             feasible.append(v)
     items = feasible
     desired_q = max(.08, min(.5, float(payload.get("size", 22))/100.))
-    desired_e = max(.05, min(.85, float(payload.get("eye_line", 35))/100.))
+    # New UI: position the common eye line as high as all crowns, the separate
+    # portrait top margin and source coverage allow. The legacy explicit eye
+    # parameter remains supported by the protocol when auto_eye_line is absent.
+    desired_e = None if payload.get("auto_eye_line", False) else max(.05, min(.85, float(payload.get("eye_line", 35))/100.))
     if not items:
         return {"solutions": [], "rejected": rejected, "unequal": False, "adjusted": False}
     domain = _portrait_domain(items)
@@ -679,8 +682,8 @@ def solve_portrait_layout(payload):
         result.append({"id": v["id"], "scale": scale, "tx": tx, "ty": ty,
             "eye_line": ei*100., "size": qi*100.})
     return {"solutions": result, "rejected": rejected, "unequal": unequal,
-        "adjusted": abs(q-desired_q) > 1e-6 or abs(e-desired_e) > 1e-6,
-        "size": q*100., "eye_line": e*100.}
+        "adjusted": abs(q-desired_q) > 1e-6 or (desired_e is not None and abs(e-desired_e) > 1e-6),
+        "size": q*100., "eye_line": None if e is None else e*100.}
 
 
 def match_with_portraits(payload):

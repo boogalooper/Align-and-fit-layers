@@ -55,11 +55,11 @@
 </g>
 <path d="M518 153 H906" stroke="#357bb0" stroke-width="2" stroke-dasharray="6 4"/>
 <text x="238" y="304" text-anchor="middle" class="label">Размер лица и высота глаз различаются</text>
-<text x="712" y="290" text-anchor="middle" class="label">Линия глаз — 35% от верха рамки</text>
-<text x="712" y="312" text-anchor="middle" class="label">Глаза–подбородок — примерно 22% высоты</text>
+<text x="712" y="290" text-anchor="middle" class="label">Общая линия глаз — автоматически</text>
+<text x="712" y="312" text-anchor="middle" class="label">Крупность задаётся одним ползунком</text>
 <path d="M464 188 h20 m-6 -6 l6 6 -6 6" fill="none" stroke="#437d7a" stroke-width="2.5"/>
 <rect x="22" y="350" width="906" height="88" rx="8" fill="#e4efee"/>
 <text x="45" y="378" class="note" font-weight="bold">Если исходное кадрирование требует большей крупности — увеличиваются все портреты.</text>
-<text x="45" y="403" class="note">При необходимости общая линия глаз сдвигается, чтобы заполнить рамки и сохранить голову.</text>
+<text x="45" y="403" class="note">Линия глаз подбирается с учётом отдельного минимального отступа над головой.</text>
 <text x="45" y="426" class="label">Схема показывает принцип. Наклон головы и естественные пропорции лиц сохраняются.</text>
 </svg>
