@@ -10,7 +10,7 @@ API_HOST = "127.0.0.1"
 API_PORT_SEND = 6321       # Python -> JSX
 API_PORT_LISTEN = 6320     # JSX -> Python
 TIMEOUT = 15 * 60
-SERVER_VERSION = "0.6.2"
+SERVER_VERSION = "0.6.3"
 
 # Models are installed with the private runtime, outside the Photoshop folder.
 # sys.prefix points to the active venv when the server is started by launcher.vbs.
@@ -68,8 +68,8 @@ class HumanSegmenter:
         cv2 = self.cv2
         np = self.np
         h, w = image_bgr.shape[:2]
-        image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        image = cv2.resize(image, (192, 192), interpolation=cv2.INTER_AREA)
+        image = cv2.resize(image_bgr, (192, 192), interpolation=cv2.INTER_AREA)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = image.astype(np.float32, copy=False) / 255.0
         image = (image - self.mean) / self.std
         blob = cv2.dnn.blobFromImage(image)
@@ -397,6 +397,7 @@ def analyze_image(path, portraits=False, cancel_event=None):
         human_mask = human_segmenter.mask(image)
         check_analysis_cancelled(cancel_event)
         face_detections = face_detector.detect(image)
+    check_analysis_cancelled(cancel_event)
 
     portrait_mask, portrait_origin = human_mask, (0, 0)
 
@@ -412,11 +413,13 @@ def analyze_image(path, portraits=False, cancel_event=None):
         cy1 = max(0, int(math.floor(by1 - margin_y)))
         cx2 = min(w, int(math.ceil(bx2 + margin_x)))
         cy2 = min(h, int(math.ceil(by2 + margin_y)))
-        if cx2 - cx1 >= 32 and cy2 - cy1 >= 32:
+        if (cx2 - cx1 >= 32 and cy2 - cy1 >= 32 and
+                (cx1 > 0 or cy1 > 0 or cx2 < w or cy2 < h)):
             crop = image[cy1:cy2, cx1:cx2]
             with model_lock:
                 check_analysis_cancelled(cancel_event)
                 refined_mask = human_segmenter.mask(crop)
+            check_analysis_cancelled(cancel_event)
             local_faces = []
             for fx1, fy1, fx2, fy2 in face_boxes:
                 if fx2 < cx1 or fx1 > cx2 or fy2 < cy1 or fy1 > cy2:

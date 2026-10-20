@@ -17,7 +17,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.7.9',
+var SCRIPT_VERSION = '0.7.10',
     SCRIPT_NAME = 'Align and fit layers',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
@@ -25,7 +25,7 @@ var SCRIPT_VERSION = '0.7.9',
     API_PORT_LISTEN = 6321,
     API_FILES = ['lib/align-fit-api.pyw', 'align-fit-api.pyw'],
     RUNTIME_NAME = 'AlignFitRuntime',
-    EXPECTED_SERVER_VERSION = '0.6.2',
+    EXPECTED_SERVER_VERSION = '0.6.3',
     PREVIEW_MAX = 1280,
     FINAL_BLEED_PX = 2,
     INIT_DELAY = 15000,
@@ -638,7 +638,7 @@ function subjectFromLocalAnalysis(id, analysis, fromPython, layerBounds) {
                 bottom: Number(layerBounds.top) + Number(b[3]) * sy,
                 faces: fromPython ? (Number(analysis.faces) || 0) : 0
             };
-        if (fromPython && isFiniteNumber(Number(analysis.visual_center_x))) {
+        if (fromPython && analysis.visual_center_x != null && isFiniteNumber(Number(analysis.visual_center_x))) {
             subject.visualCenterX = Number(layerBounds.left) + Number(analysis.visual_center_x) * sx;
         }
         if (fromPython && cfg.portraits && Number(analysis.faces) == 1 && analysis.portrait) {
