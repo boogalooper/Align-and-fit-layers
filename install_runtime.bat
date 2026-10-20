@@ -2,7 +2,7 @@
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 
-set "INSTALLER_VERSION=11"
+set "INSTALLER_VERSION=12"
 set "RUNTIME=%LOCALAPPDATA%\JazzyScripts\AlignFitRuntime"
 set "UV_DIR=%RUNTIME%\uv"
 set "UV_STAGE=%RUNTIME%\uv.new"
@@ -14,15 +14,18 @@ set "PY=%VENV%\Scripts\python.exe"
 set "MODELS=%VENV%\models"
 set "HUMAN_OUT=%MODELS%\human.onnx"
 set "FACE_OUT=%MODELS%\face.onnx"
+set "LANDMARK_OUT=%MODELS%\face_landmarker.task"
 
 set "PY_VERSION=3.11.16"
 set "NUMPY_VERSION=2.2.6"
 set "OPENCV_VERSION=4.12.0.88"
+set "MEDIAPIPE_VERSION=0.10.32"
 set "UV_VERSION=0.12.19"
 set "PIP_INSECURE=0"
 
 set "UV_SHA256=6dbb02d79e419522f1c500f0adb1cddcff0cda7d59b0d66ea7f5e3b4a1b2f5f0"
 set "HUMAN_SHA256=552d8a984054e59b5d773d24b9b12022b22046ceb2bbc4c9aaeaceb36a9ddf24"
+set "LANDMARK_SHA256=64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff"
 set "FACE_SHA256=8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
 
 set "UV_URL=https://releases.astral.sh/github/uv/releases/download/%UV_VERSION%/uv-x86_64-pc-windows-msvc.zip"
@@ -32,10 +35,12 @@ set "HUMAN_URL2=https://huggingface.co/opencv/opencv_zoo/resolve/main/models/hum
 set "FACE_URL=https://github.com/opencv/opencv_zoo/raw/refs/heads/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 set "FACE_URL2=https://huggingface.co/opencv/opencv_zoo/resolve/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 
+set "LANDMARK_URL=https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 set "DOWNLOAD_DIR=%TEMP%\AlignFitRuntimeDownloads"
 set "UV_ZIP_TMP=%DOWNLOAD_DIR%\uv-x86_64-pc-windows-msvc.zip"
 set "HUMAN_TMP=%DOWNLOAD_DIR%\human.onnx.download"
 set "FACE_TMP=%DOWNLOAD_DIR%\face.onnx.download"
+set "LANDMARK_TMP=%DOWNLOAD_DIR%\face_landmarker.task.download"
 set "LAUNCHER_TMP=%RUNTIME%\launcher.vbs.new"
 set "VERSION_TMP=%RUNTIME%\runtime_version.txt.new"
 
@@ -58,7 +63,8 @@ echo Installer revision: %INSTALLER_VERSION%
 echo Runtime: %RUNTIME%
 echo CPython: %PY_VERSION% x64 via uv
 echo NumPy: %NUMPY_VERSION%
-echo OpenCV: %OPENCV_VERSION%
+echo OpenCV contrib: %OPENCV_VERSION%
+echo MediaPipe: %MEDIAPIPE_VERSION%
 echo ==============================================
 echo.
 
@@ -271,7 +277,7 @@ if not errorlevel 1 (
 exit /b 0
 
 :ensure_packages
-"%PY%" -c "import importlib.metadata as m,sys; ok=(m.version('numpy')=='%NUMPY_VERSION%' and m.version('opencv-python')=='%OPENCV_VERSION%'); import numpy,cv2; ok=ok and hasattr(cv2,'FaceDetectorYN') and hasattr(cv2,'dnn'); raise SystemExit(0 if ok else 1)" >nul 2>&1
+"%PY%" -c "import importlib.metadata as m,sys; ok=(m.version('numpy')=='%NUMPY_VERSION%' and m.version('mediapipe')=='%MEDIAPIPE_VERSION%' and m.version('opencv-contrib-python')=='%OPENCV_VERSION%'); import numpy,cv2,mediapipe; ok=ok and not any(d.metadata['Name'].lower() in ('opencv-python','opencv-python-headless','opencv-contrib-python-headless') for d in m.distributions()); ok=ok and hasattr(cv2,'FaceDetectorYN') and hasattr(cv2,'dnn'); raise SystemExit(0 if ok else 1)" >nul 2>&1
 if not errorlevel 1 (
     echo Existing Python packages OK.
     "%UV%" pip check --python "%PY%"
@@ -282,10 +288,14 @@ if not errorlevel 1 (
 :install_packages
 echo.
 echo Installing pinned binary packages into the private venv...
+rem All OpenCV distributions share cv2. Remove old variants before installing
+rem the single contrib distribution required by MediaPipe.
+"%UV%" pip uninstall --python "%PY%" opencv-python opencv-python-headless opencv-contrib-python-headless
+if errorlevel 1 exit /b 1
 if "%PIP_INSECURE%"=="1" (
-    "%UV%" pip install --python "%PY%" --upgrade --no-build "numpy==%NUMPY_VERSION%" "opencv-python==%OPENCV_VERSION%" --allow-insecure-host pypi.org --allow-insecure-host files.pythonhosted.org
+    "%UV%" pip install --python "%PY%" --upgrade --no-build --reinstall-package opencv-contrib-python "numpy==%NUMPY_VERSION%" "opencv-contrib-python==%OPENCV_VERSION%" "mediapipe==%MEDIAPIPE_VERSION%" --allow-insecure-host pypi.org --allow-insecure-host files.pythonhosted.org
 ) else (
-    "%UV%" pip install --python "%PY%" --upgrade --no-build "numpy==%NUMPY_VERSION%" "opencv-python==%OPENCV_VERSION%"
+    "%UV%" pip install --python "%PY%" --upgrade --no-build --reinstall-package opencv-contrib-python "numpy==%NUMPY_VERSION%" "opencv-contrib-python==%OPENCV_VERSION%" "mediapipe==%MEDIAPIPE_VERSION%"
 )
 if errorlevel 1 (
     if "%PIP_INSECURE%"=="1" (
@@ -307,7 +317,7 @@ if errorlevel 1 (
     echo [ERROR] Installed Python packages have dependency conflicts.
     exit /b 1
 )
-"%PY%" -c "import importlib.metadata as m,sys,numpy,cv2; ok=(m.version('numpy')=='%NUMPY_VERSION%' and m.version('opencv-python')=='%OPENCV_VERSION%' and hasattr(cv2,'FaceDetectorYN') and hasattr(cv2,'dnn')); print('Python packages: NumPy',numpy.__version__,'| OpenCV',cv2.__version__); raise SystemExit(0 if ok else 1)"
+"%PY%" -c "import importlib.metadata as m,sys,numpy,cv2; ok=(m.version('numpy')=='%NUMPY_VERSION%' and m.version('mediapipe')=='%MEDIAPIPE_VERSION%' and m.version('opencv-contrib-python')=='%OPENCV_VERSION%' and hasattr(cv2,'FaceDetectorYN') and hasattr(cv2,'dnn')); print('Python packages: NumPy',numpy.__version__,'| OpenCV',cv2.__version__); raise SystemExit(0 if ok else 1)"
 if errorlevel 1 (
     echo [ERROR] Python package validation failed.
     exit /b 1
@@ -360,6 +370,17 @@ if errorlevel 1 (
     echo Existing model OK: face.onnx
 )
 
+call :verify_hash "%LANDMARK_OUT%" "%LANDMARK_SHA256%"
+if errorlevel 1 (
+    echo Downloading face_landmarker.task...
+    call :download_verified "%LANDMARK_URL%" "" "%LANDMARK_TMP%" "%LANDMARK_SHA256%" "face_landmarker.task"
+    if errorlevel 1 exit /b 1
+    copy /y "%LANDMARK_TMP%" "%LANDMARK_OUT%" >nul
+    if errorlevel 1 exit /b 1
+)
+call :verify_hash "%LANDMARK_OUT%" "%LANDMARK_SHA256%"
+if errorlevel 1 exit /b 1
+
 call :verify_hash "%HUMAN_OUT%" "%HUMAN_SHA256%"
 if errorlevel 1 (
     echo [ERROR] Installed human.onnx failed SHA-256 verification.
@@ -405,7 +426,7 @@ exit /b 0
 :self_test
 echo.
 echo Running runtime/model self-test...
-"%PY%" -c "import os,sys,struct,importlib.metadata as m,cv2,numpy as np; assert sys.version_info[:3]==(3,11,16) and struct.calcsize('P')==8; assert m.version('numpy')=='%NUMPY_VERSION%'; assert m.version('opencv-python')=='%OPENCV_VERSION%'; model=os.path.join(sys.prefix,'models'); h=os.path.join(model,'human.onnx'); f=os.path.join(model,'face.onnx'); assert os.path.isfile(h) and os.path.isfile(f); net=cv2.dnn.readNet(h); det=cv2.FaceDetectorYN.create(f,'',(320,320),0.6,0.3,5000); assert net is not None and det is not None; print('OK | Python',sys.version.split()[0],'| OpenCV',cv2.__version__,'| NumPy',np.__version__,'| Models',model)"
+"%PY%" -c "import os,sys,struct,importlib.metadata as m,cv2,numpy as np; assert sys.version_info[:3]==(3,11,16) and struct.calcsize('P')==8; assert m.version('numpy')=='%NUMPY_VERSION%'; assert m.version('opencv-contrib-python')=='%OPENCV_VERSION%'; model=os.path.join(sys.prefix,'models'); h=os.path.join(model,'human.onnx'); f=os.path.join(model,'face.onnx'); assert os.path.isfile(h) and os.path.isfile(f); net=cv2.dnn.readNet(h); det=cv2.FaceDetectorYN.create(f,'',(320,320),0.6,0.3,5000); assert net is not None and det is not None; import mediapipe as mp; from mediapipe.tasks.python import BaseOptions,vision; lm=vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(base_options=BaseOptions(model_asset_path=os.path.join(model,'face_landmarker.task')),num_faces=1)); lm.close(); assert m.version('mediapipe')=='%MEDIAPIPE_VERSION%'; print('OK | Python',sys.version.split()[0],'| OpenCV',cv2.__version__,'| NumPy',np.__version__,'| Models',model)"
 if errorlevel 1 (
     echo [ERROR] Runtime/model self-test failed.
     exit /b 1
@@ -471,6 +492,7 @@ if exist "%UV_STAGE%" rmdir /s /q "%UV_STAGE%" >nul 2>&1
 if exist "%UV_ZIP_TMP%" del /f /q "%UV_ZIP_TMP%" >nul 2>&1
 if exist "%HUMAN_TMP%" del /f /q "%HUMAN_TMP%" >nul 2>&1
 if exist "%FACE_TMP%" del /f /q "%FACE_TMP%" >nul 2>&1
+if exist "%LANDMARK_TMP%" del /f /q "%LANDMARK_TMP%" >nul 2>&1
 if exist "%LAUNCHER_TMP%" del /f /q "%LAUNCHER_TMP%" >nul 2>&1
 if exist "%VERSION_TMP%" del /f /q "%VERSION_TMP%" >nul 2>&1
 exit /b 0

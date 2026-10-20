@@ -10,7 +10,7 @@ API_HOST = "127.0.0.1"
 API_PORT_SEND = 6321       # Python -> JSX
 API_PORT_LISTEN = 6320     # JSX -> Python
 TIMEOUT = 15 * 60
-SERVER_VERSION = "0.4.8"
+SERVER_VERSION = "0.5.1"
 
 # Models are installed with the private runtime, outside the Photoshop folder.
 # sys.prefix points to the active venv when the server is started by launcher.vbs.
@@ -374,7 +374,7 @@ def visual_center_x(mask_bbox, mask_center_x, face_boxes, side_cropped=False):
     return max(x1, min(x2, result))
 
 
-def analyze_image(path):
+def analyze_image(path, portraits=False):
     np, cv2, human_segmenter, face_detector = get_models()
     image = read_image(path, np, cv2)
     if image is None:
@@ -452,7 +452,7 @@ def analyze_image(path):
             visual_x = (bbox[0] + bbox[2]) * 0.5
         visual_x = max(float(bbox[0]), min(float(bbox[2]), float(visual_x)))
 
-    return {
+    result = {
         "bbox": bbox,
         "faces": len(face_boxes),
         "visual_center_x": visual_x,
@@ -460,6 +460,246 @@ def analyze_image(path):
         "width": int(w),
         "height": int(h),
     }
+
+    # Nothing portrait-specific is loaded or computed unless explicitly requested.
+    # Require one raw AND one retained detection: a group must not become a
+    # portrait merely because a second small face was filtered out.
+    if portraits and len(face_boxes) == 1 and len(face_detections) == 1 and bbox is not None:
+        try:
+            result["portrait"] = portrait_measurements(image, face_boxes[0], bbox, np, cv2)
+            if result["portrait"] is None:
+                result["portrait_error"] = "Unreliable face landmarks"
+        except Exception as exc:
+            result["portrait_error"] = str(exc)
+    return result
+
+
+
+# Lazy imports keep the existing geometric/group workflow independent of
+# MediaPipe. Initialization errors are cached, avoiding repeated failed loads.
+_portrait_detector = None
+_portrait_error = None
+_portrait_lock = threading.Lock()
+
+
+def portrait_measurements(image, box, envelope, np, cv2):
+    global _portrait_detector, _portrait_error
+    with _portrait_lock:
+        if _portrait_error:
+            raise RuntimeError(_portrait_error)
+        if _portrait_detector is None:
+            try:
+                import mediapipe as mp
+                from mediapipe.tasks.python import BaseOptions, vision
+                model = os.path.join(MODEL_DIR, "face_landmarker.task")
+                if not os.path.isfile(model):
+                    raise RuntimeError("face_landmarker.task missing; run install_runtime.bat")
+                _portrait_detector = vision.FaceLandmarker.create_from_options(
+                    vision.FaceLandmarkerOptions(base_options=BaseOptions(model_asset_path=model),
+                        running_mode=vision.RunningMode.IMAGE, num_faces=1,
+                        output_face_blendshapes=False, output_facial_transformation_matrixes=False))
+            except Exception as exc:
+                _portrait_error = "Portrait analysis unavailable; run install_runtime.bat: %s" % exc
+                raise RuntimeError(_portrait_error)
+        import mediapipe as mp
+        # Analyze a face crop for stable detail even on full-length photographs.
+        h, w = image.shape[:2]
+        x1, y1, x2, y2 = box
+        pad = max(x2-x1, y2-y1) * .65
+        ox, oy = max(0, int(x1-pad)), max(0, int(y1-pad))
+        crop = image[oy:min(h, int(math.ceil(y2+pad))), ox:min(w, int(math.ceil(x2+pad)))]
+        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        detected = _portrait_detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+        if not detected.face_landmarks:
+            return None
+        ch, cw = crop.shape[:2]
+        mesh = detected.face_landmarks[0]
+        # Only these 11 points are used by the six metrics and composition.
+        points = {i: [mesh[i].x*cw+ox, mesh[i].y*ch+oy]
+            for i in (10, 33, 263, 133, 362, 234, 454, 127, 356, 152, 168)}
+    def dist(a, b):
+        return math.hypot(a[0]-b[0], a[1]-b[1])
+    eyes = [(points[33][j]+points[263][j])*.5 for j in (0, 1)]
+    if not (x1 <= eyes[0] <= x2 and y1 <= eyes[1] <= y2):
+        return None
+    metrics = [dist(points[33], points[263]), dist(points[133], points[362]),
+        dist(points[234], points[454]), dist(points[127], points[356]),
+        dist(eyes, points[152]), dist(points[168], points[152])]
+    if not all(math.isfinite(v) and v > 2 for v in metrics):
+        return None
+    # Large yaw makes 2D facial scale unreliable; retain the ordinary placement.
+    left, right = dist(points[127], points[33]), dist(points[356], points[263])
+    if min(left, right) < .25 * max(left, right) or metrics[0] < 12:
+        return None
+    return {"eye": eyes, "metrics": metrics,
+        "head_top": max(0., min(float(envelope[1]), points[10][1])),
+        "chin": max(eyes[1]+1., points[152][1]),
+        "head_left": max(0., min(box[0], points[234][0], points[127][0]) - metrics[0]*.15),
+        "head_right": min(float(w), max(box[2], points[454][0], points[356][0]) + metrics[0]*.15)}
+
+
+def facial_ratio(reference, measured):
+    """Same robust six-measurement ratio as Face alignment, without head bias."""
+    weights = [.25, .10, .15, .10, .25, .15]
+    items = sorted((math.log(a/b), w) for a, b, w in zip(reference, measured, weights)
+        if a > 2 and b > 2 and math.isfinite(a) and math.isfinite(b))
+    if len(items) < 4:
+        raise ValueError("Insufficient face measurements")
+    acc, center = 0., items[0][0]
+    half_weight = sum(w for _, w in items)*.5
+    for value, weight in items:
+        acc += weight
+        if acc >= half_weight:
+            center = value
+            break
+    cutoff, huber = math.log(1.25), math.log(1.06)
+    items = [(v, w) for v, w in items if abs(v-center) <= cutoff]
+    if len(items) < 3:
+        raise ValueError("Inconsistent face proportions")
+    for _ in range(3):
+        robust = [(v, w*min(1., huber/max(1e-12, abs(v-center)))) for v, w in items]
+        center = sum(v*w for v, w in robust)/sum(w for _, w in robust)
+    return math.exp(center)
+
+
+def _portrait_domain(items):
+    # Every constraint is linear in common face size q and common eye height e.
+    # e >= a*q+b (lower); e <= a*q+b (upper). Pairwise inequalities give
+    # an exact feasible q interval, without grids or iterative searches.
+    lower, upper = [(0., .05)], [(0., .85)]
+    qlo, qhi = .001, float("inf")
+    for v in items:
+        h, w, H, W, u = v["h"], v["w"], v["H"], v["W"], v["unit"]
+        ey, bleed = v["ey"], v["bleed"]
+        qlo = max(qlo, (W+2*bleed)*u/(w*H))
+        if "head_left" in v:
+            left, right = v["head_left"], v["head_right"]
+            if left <= 0 or right >= w or right <= left:
+                return None  # already cropped at an image edge
+            qlo = max(qlo, bleed*u/(H*left), bleed*u/(H*(w-right)))
+            qhi = min(qhi, W*u/(H*(right-left)))
+        lower.extend([(-(h-ey)/u, 1+bleed/H), ((ey-v["head_top"])/u, v["top"])])
+        upper.extend([(ey/u, -bleed/H), (-(v["chin"]-ey)/u, 1-v["bottom"])])
+    for a, b in lower:
+        for c, d in upper:
+            k, rhs = a-c, d-b
+            if abs(k) < 1e-12:
+                if rhs < -1e-9:
+                    return None
+            elif k > 0:
+                qhi = min(qhi, rhs/k)
+            else:
+                qlo = max(qlo, rhs/k)
+    if qhi < qlo-1e-9 or qhi <= 0:
+        return None
+    return max(.001, qlo), max(qlo, qhi), lower, upper
+
+
+def _choose_portrait(domain, q, e):
+    lo, hi, lower, upper = domain
+    q = max(lo, min(hi, q))
+    elo = max(a*q+b for a, b in lower)
+    ehi = min(a*q+b for a, b in upper)
+    return q, max(elo, min(ehi, e))
+
+
+def solve_portrait_layout(payload):
+    source = payload.get("items") or []
+    if not source:
+        return {"solutions": [], "adjusted": False, "unequal": False}
+    # Choose a median face as the robust reference; no dependence on layer order.
+    reference = sorted(source, key=lambda v: (v["portrait"]["metrics"][4], str(v["id"])))[len(source)//2]["portrait"]["metrics"]
+    items, rejected = [], []
+    for item in source:
+        p, layer, frame = item["portrait"], item["layer"], item["frame"]
+        try:
+            ratio = facial_ratio(reference, p["metrics"])
+            unit = reference[4]/ratio
+            v = {"id": item["id"], "w": float(layer["width"]), "h": float(layer["height"]),
+                "H": float(frame["height"]), "W": float(frame["width"]),
+                "fx": float(frame["left"]), "fy": float(frame["top"]),
+                "ex": float(p["eye"][0])-float(layer["left"]),
+                "ey": float(p["eye"][1])-float(layer["top"]),
+                "head_top": float(p["head_top"])-float(layer["top"]),
+                "chin": float(p["chin"])-float(layer["top"]), "unit": unit,
+                "top": float(item.get("top", 0))/100., "bottom": .015,
+                "bleed": max(0., float(payload.get("bleed", 2)))}
+            if not all(math.isfinite(v[k]) and v[k] > 0 for k in ("w", "h", "H", "W", "unit")):
+                raise ValueError("Invalid geometry")
+            if not (0 < v["ex"] < v["w"] and 0 < v["ey"] < v["h"]):
+                raise ValueError("Face outside image")
+            if "head_left" in p and "head_right" in p:
+                v["head_left"] = float(p["head_left"])-float(layer["left"])
+                v["head_right"] = float(p["head_right"])-float(layer["left"])
+            items.append(v)
+        except (ValueError, KeyError, TypeError, ZeroDivisionError, OverflowError):
+            rejected.append(item["id"])
+    # An intrinsically impossible/cropped source must not break equality for
+    # every other portrait. Exclude it first and keep its ordinary placement.
+    feasible = []
+    for v in items:
+        v["domain"] = _portrait_domain([v])
+        if v["domain"] is None:
+            rejected.append(v["id"])
+        else:
+            feasible.append(v)
+    items = feasible
+    desired_q = max(.08, min(.5, float(payload.get("size", 22))/100.))
+    desired_e = max(.05, min(.85, float(payload.get("eye_line", 35))/100.))
+    if not items:
+        return {"solutions": [], "rejected": rejected, "unequal": False, "adjusted": False}
+    domain = _portrait_domain(items)
+    unequal = domain is None
+    if domain:
+        q, e = _choose_portrait(domain, desired_q, desired_e)
+    else:
+        # Incompatible original crops: preserve heads/coverage, and minimize each
+        # portrait's departure from the common requested composition. Never hide
+        # this compromise from the caller.
+        q, e = desired_q, desired_e
+    result = []
+    for v in items:
+        if unequal:
+            individual = v["domain"]
+            if not individual:
+                rejected.append(v["id"])
+                continue
+            qi, ei = _choose_portrait(individual, q, e)
+        else:
+            qi, ei = q, e
+        scale = qi*v["H"]/v["unit"]
+        tx = v["fx"]+v["W"]*.5-scale*v["ex"]
+        xlo = v["fx"]+v["W"]+v["bleed"]-scale*v["w"]
+        xhi = v["fx"]-v["bleed"]
+        if "head_left" in v:
+            xlo = max(xlo, v["fx"]-scale*v["head_left"])
+            xhi = min(xhi, v["fx"]+v["W"]-scale*v["head_right"])
+        tx = max(xlo, min(xhi, tx))
+        ty = v["fy"]+ei*v["H"]-scale*v["ey"]
+        result.append({"id": v["id"], "scale": scale, "tx": tx, "ty": ty,
+            "eye_line": ei*100., "size": qi*100.})
+    return {"solutions": result, "rejected": rejected, "unequal": unequal,
+        "adjusted": abs(q-desired_q) > 1e-6 or abs(e-desired_e) > 1e-6,
+        "size": q*100., "eye_line": e*100.}
+
+
+def match_with_portraits(payload):
+    assignments = match_items(payload)
+    answer = {"assignments": assignments}
+    options = payload.get("portrait_options")
+    if options is None:
+        return answer
+    subjects = {str(v["id"]): v for v in payload.get("subjects", [])}
+    frames = {str(v["id"]): v for v in payload.get("frames", [])}
+    items = []
+    for pair in assignments:
+        subject = subjects.get(str(pair["subject_id"]))
+        frame = frames.get(str(pair["frame_id"]))
+        if subject and frame and subject.get("portrait") and not subject.get("bounds_only"):
+            items.append({"id": subject["id"], "portrait": subject["portrait"],
+                "layer": subject["layer"], "frame": frame, "top": frame.get("portrait_top", 0)})
+    answer["portrait_layout"] = solve_portrait_layout(dict(options, items=items))
+    return answer
 
 
 def average_ranks(items, key_func):
@@ -729,7 +969,7 @@ def handle_client(client_socket, server):
                     item_id = item.get("id")
                     path = item.get("path", "")
                     try:
-                        info = analyze_image(path)
+                        info = analyze_image(path, portraits=bool((payload or {}).get("portraits", False)))
                         info["id"] = item_id
                         result.append(info)
                     except Exception as exc:
@@ -745,9 +985,10 @@ def handle_client(client_socket, server):
                     finally:
                         safe_remove_preview(path)
                 reply("answer", {"items": result})
+            elif msg_type == "portrait_layout":
+                reply("answer", solve_portrait_layout(payload or {}))
             elif msg_type == "match":
-                result = match_items(payload or {})
-                reply("answer", {"assignments": result})
+                reply("answer", match_with_portraits(payload or {}))
             elif msg_type == "exit":
                 reply("answer", "bye")
                 try:

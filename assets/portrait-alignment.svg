@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="950" height="460" viewBox="0 0 950 460" role="img" aria-labelledby="title desc">
+<title id="title">Одинаковая крупность портретов и согласованная линия глаз</title>
+<desc id="desc">Слева лица разного размера и на разной высоте. Справа лица согласованы по крупности, а середины глаз находятся на 35 процентах высоты рамок. Если один исходник требует большего увеличения, крупность корректируется совместно.</desc>
+<defs><style>text{font-family:Arial,DejaVu Sans,sans-serif;fill:#303940}.heading{font-size:19px;font-weight:bold}.label{font-size:14px}.note{font-size:15px}.frame{fill:#e4efee;stroke:#437d7a;stroke-width:2}</style></defs>
+<rect width="950" height="460" rx="12" fill="#f6f7f9"/>
+<text x="238" y="35" text-anchor="middle" class="heading">Разное исходное кадрирование</text>
+<text x="712" y="35" text-anchor="middle" class="heading">Общая крупность и линия глаз</text>
+<rect x="22" y="52" width="432" height="280" rx="8" fill="white" stroke="#ccd8dc"/>
+<rect x="496" y="52" width="432" height="280" rx="8" fill="white" stroke="#ccd8dc"/>
+
+<clipPath id="clip0"><rect x="56" y="90" width="104" height="180"/></clipPath>
+<rect x="56" y="90" width="104" height="180" rx="3" class="frame"/>
+<g clip-path="url(#clip0)">
+<path d="M64.8 285 L72.0 191.51999999999998 Q108.0 164.16 144.0 191.51999999999998 L151.2 285 Z" fill="#70aaa7"/>
+<ellipse cx="108.0" cy="147.6" rx="18.720000000000002" ry="25.2" fill="#70aaa7" stroke="#437d7a" stroke-width="1.5"/>
+<path d="M97.92 144.0 h3.456 M114.624 144.0 h3.456" stroke="#303940" stroke-width="2"/>
+</g>
+<path d="M52 144.0 h112" stroke="#87969b" stroke-width="1.5" stroke-dasharray="4 3"/>
+<clipPath id="clip1"><rect x="184" y="90" width="104" height="180"/></clipPath>
+<rect x="184" y="90" width="104" height="180" rx="3" class="frame"/>
+<g clip-path="url(#clip1)">
+<path d="M163.1 285 L175.25 249.39 Q236.0 203.21999999999997 296.75 249.39 L308.9 285 Z" fill="#70aaa7"/>
+<ellipse cx="236.0" cy="175.27499999999998" rx="31.590000000000003" ry="42.525" fill="#70aaa7" stroke="#437d7a" stroke-width="1.5"/>
+<path d="M218.99 169.2 h5.832 M247.178 169.2 h5.832" stroke="#303940" stroke-width="2"/>
+</g>
+<path d="M180 169.2 h112" stroke="#87969b" stroke-width="1.5" stroke-dasharray="4 3"/>
+<clipPath id="clip2"><rect x="312" y="90" width="104" height="180"/></clipPath>
+<rect x="312" y="90" width="104" height="180" rx="3" class="frame"/>
+<g clip-path="url(#clip2)">
+<path d="M307.3 285 L316.75 213.57 Q364.0 177.66 411.25 213.57 L420.7 285 Z" fill="#70aaa7"/>
+<ellipse cx="364.0" cy="155.92499999999998" rx="24.57" ry="33.074999999999996" fill="#70aaa7" stroke="#437d7a" stroke-width="1.5"/>
+<path d="M350.77 151.2 h4.536 M372.694 151.2 h4.536" stroke="#303940" stroke-width="2"/>
+</g>
+<path d="M308 151.2 h112" stroke="#87969b" stroke-width="1.5" stroke-dasharray="4 3"/>
+<clipPath id="clip3"><rect x="530" y="90" width="104" height="180"/></clipPath>
+<rect x="530" y="90" width="104" height="180" rx="3" class="frame"/>
+<g clip-path="url(#clip3)">
+<path d="M522.6 285 L532.5 218.34 Q582.0 180.72 631.5 218.34 L641.4 285 Z" fill="#70aaa7"/>
+<ellipse cx="582.0" cy="157.95" rx="25.740000000000002" ry="34.65" fill="#70aaa7" stroke="#437d7a" stroke-width="1.5"/>
+<path d="M568.14 153.0 h4.752 M591.108 153.0 h4.752" stroke="#303940" stroke-width="2"/>
+</g>
+<clipPath id="clip4"><rect x="658" y="90" width="104" height="180"/></clipPath>
+<rect x="658" y="90" width="104" height="180" rx="3" class="frame"/>
+<g clip-path="url(#clip4)">
+<path d="M650.6 285 L660.5 218.34 Q710.0 180.72 759.5 218.34 L769.4 285 Z" fill="#70aaa7"/>
+<ellipse cx="710.0" cy="157.95" rx="25.740000000000002" ry="34.65" fill="#70aaa7" stroke="#437d7a" stroke-width="1.5"/>
+<path d="M696.14 153.0 h4.752 M719.108 153.0 h4.752" stroke="#303940" stroke-width="2"/>
+</g>
+<clipPath id="clip5"><rect x="786" y="90" width="104" height="180"/></clipPath>
+<rect x="786" y="90" width="104" height="180" rx="3" class="frame"/>
+<g clip-path="url(#clip5)">
+<path d="M778.6 285 L788.5 218.34 Q838.0 180.72 887.5 218.34 L897.4 285 Z" fill="#70aaa7"/>
+<ellipse cx="838.0" cy="157.95" rx="25.740000000000002" ry="34.65" fill="#70aaa7" stroke="#437d7a" stroke-width="1.5"/>
+<path d="M824.14 153.0 h4.752 M847.108 153.0 h4.752" stroke="#303940" stroke-width="2"/>
+</g>
+<path d="M518 153 H906" stroke="#357bb0" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="238" y="304" text-anchor="middle" class="label">Размер лица и высота глаз различаются</text>
+<text x="712" y="290" text-anchor="middle" class="label">Линия глаз — 35% от верха рамки</text>
+<text x="712" y="312" text-anchor="middle" class="label">Глаза–подбородок — примерно 22% высоты</text>
+<path d="M464 188 h20 m-6 -6 l6 6 -6 6" fill="none" stroke="#437d7a" stroke-width="2.5"/>
+<rect x="22" y="350" width="906" height="88" rx="8" fill="#e4efee"/>
+<text x="45" y="378" class="note" font-weight="bold">Если исходное кадрирование требует большей крупности — увеличиваются все портреты.</text>
+<text x="45" y="403" class="note">При необходимости общая линия глаз сдвигается, чтобы заполнить рамки и сохранить голову.</text>
+<text x="45" y="426" class="label">Схема показывает принцип. Наклон головы и естественные пропорции лиц сохраняются.</text>
+</svg>

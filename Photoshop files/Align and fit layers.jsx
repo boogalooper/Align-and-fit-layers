@@ -17,14 +17,14 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.5.44',
+var SCRIPT_VERSION = '0.6.3',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
     API_PORT_SEND = 6320,
     API_PORT_LISTEN = 6321,
     API_FILES = ['lib/align-fit-api.pyw', 'align-fit-api.pyw'],
     RUNTIME_NAME = 'AlignFitRuntime',
-    EXPECTED_SERVER_VERSION = '0.4.8',
+    EXPECTED_SERVER_VERSION = '0.5.1',
     PREVIEW_MAX = 1280,
     FINAL_BLEED_PX = 2,
     INIT_DELAY = 15000,
@@ -238,7 +238,7 @@ function createRunContext() {
     } else {
         // Decide normal-vs-fallback BEFORE object detection. This prevents the
         // common-reference layer from being unnecessarily analyzed as a subject.
-        var selectedSet = {}, subjectCounts = {}, from = doc.getProperty('hasBackgroundLayer') ? 0 : 1,
+        var selectedSet = {}, subjectCounts = {}, from = metadata.backgroundOffset ? 0 : 1,
             len = doc.getProperty('numberOfLayers');
         for (var si = 0; si < targetIds.length; si++) {
             selectedSet[String(targetIds[si])] = true;
@@ -302,6 +302,7 @@ function createRunContext() {
 
     return {
         sourceDoc: sourceDoc,
+        stackIndexOffset: metadata.backgroundOffset,
         startHistoryState: sourceDoc.activeHistoryState,
         targetIds: targetIds,
         subjectTargetIds: subjectTargetIds,
@@ -375,6 +376,7 @@ function preparePythonPreviewChunk(i) {
     lr.selectLayer(id);
     if (!lr.getProperty('visible')) lr.setLayerVisiblity(id, true);
     runCtx.previewTouched = true;
+    protectTemporarySmartObjectName(id, name);
     var preview = exportLayerPreview(runCtx.sourceDoc, id, i, runCtx.tempFiles);
     if (preview) runCtx.items.push(preview);
     app.changeProgressText(text);
@@ -394,7 +396,7 @@ function analyzePythonStage() {
     // Large selections can legitimately take longer than the fixed base timeout.
     // Keep a generous per-image allowance while capping the wait at 15 minutes.
     var analyzeDelay = Math.max(ANALYZE_DELAY, Math.min(15 * 60 * 1000, runCtx.items.length * 10000)),
-        analyzed = afApi.sendPayload('analyze', { items: runCtx.items }, analyzeDelay, true);
+        analyzed = afApi.sendPayload('analyze', { items: runCtx.items, portraits: !!cfg.portraits }, analyzeDelay, true);
     if (!analyzed || !analyzed.items) throw new Error('Python returned an invalid analysis response.');
     runCtx.analysisMap = {};
     for (var ai = 0; ai < analyzed.items.length; ai++) {
@@ -466,6 +468,7 @@ function measureAutoCutoutInSmartObject(sourceDoc, id) {
         app.activeDocument = sourceDoc;
         lr.selectLayer(id);
 
+        protectTemporarySmartObjectName(id, runCtx.layerMeta[String(id)].name);
         stage = 'convert source layer to Smart Object';
         convertActiveLayerToSmartObject();
 
@@ -554,6 +557,7 @@ function mainHistory() {
     prepareFrameList();
     app.doProgressSegmentTask(m0 - f0, f0, 100, 'readFramesStage();');
     app.doProgressSegmentTask(a0 - m0, m0, 100, 'matchFramesStage();');
+    preparePortraitPlacements();
     app.doProgressSegmentTask(100 - a0, a0, 100, 'alignSubjectsStage();');
 }
 
@@ -640,6 +644,18 @@ function subjectFromLocalAnalysis(id, analysis, fromPython, layerBounds) {
         if (fromPython && isFiniteNumber(Number(analysis.visual_center_x))) {
             subject.visualCenterX = Number(layerBounds.left) + Number(analysis.visual_center_x) * sx;
         }
+        if (fromPython && cfg.portraits && Number(analysis.faces) == 1 && analysis.portrait) {
+            var p = analysis.portrait, metricScale = Math.sqrt(sx * sy), metrics = [];
+            for (var pi = 0; pi < p.metrics.length; pi++) metrics.push(Number(p.metrics[pi]) * metricScale);
+            subject.portrait = {
+                eye: [Number(layerBounds.left) + Number(p.eye[0]) * sx, Number(layerBounds.top) + Number(p.eye[1]) * sy],
+                metrics: metrics,
+                head_top: Number(layerBounds.top) + Number(p.head_top) * sy,
+                head_left: Number(layerBounds.left) + Number(p.head_left) * sx,
+                head_right: Number(layerBounds.left) + Number(p.head_right) * sx,
+                chin: Number(layerBounds.top) + Number(p.chin) * sy
+            };
+        }
         subject.width = subject.right - subject.left;
         subject.height = subject.bottom - subject.top;
         // Relative source-edge distance, measured before Python's safety padding.
@@ -717,6 +733,7 @@ function LayerMetadataCache() {
     };
     var backgroundOffset = doc.getProperty('hasBackgroundLayer') ? 1 : 0,
         minimumIndex = backgroundOffset ? 0 : 1;
+    this.backgroundOffset = backgroundOffset;
 }
 
 function getBottomMostSelectedLayerId(ids, metadata) {
@@ -809,7 +826,7 @@ function matchFramesStage() {
         return;
     }
     if (cfg.engine == 'python') {
-        var matchSubjects = [], matchFrames = [];
+        var matchSubjects = [], matchFrames = [], portraitCount = 0;
         for (var i = 0; i < runCtx.subjects.length; i++) {
             var placementCosts = {};
             for (var pc = 0; pc < runCtx.frames.length; pc++) {
@@ -824,16 +841,30 @@ function matchFramesStage() {
                 bounds_only: !!runCtx.subjects[i].boundsOnly,
                 placement_costs: placementCosts
             });
+            if (cfg.portraits && runCtx.subjects[i].portrait && !usesLayerBoundsPlacement(runCtx.subjects[i])) {
+                matchSubjects[matchSubjects.length - 1].portrait = runCtx.subjects[i].portrait;
+                matchSubjects[matchSubjects.length - 1].layer = runCtx.subjects[i].layer;
+                portraitCount++;
+            }
         }
         for (var j = 0; j < runCtx.frames.length; j++) {
             matchFrames.push({ id: runCtx.frames[j].id, color: runCtx.frames[j].color, ratio: runCtx.frames[j].ratio, area: runCtx.frames[j].area });
+            if (portraitCount) {
+                var pf = matchFrames[matchFrames.length - 1], f = runCtx.frames[j];
+                pf.left = f.left; pf.top = f.top; pf.width = f.width; pf.height = f.height;
+                pf.portrait_top = f.vertical ? cfg.vTop : cfg.hTop;
+            }
         }
-        var matched = afApi.sendPayload('match', {
+        var matchPayload = {
             subjects: matchSubjects,
             frames: matchFrames,
             use_face_count: !!cfg.useFaceCount
-        }, MATCH_DELAY);
+        };
+        if (portraitCount) matchPayload.portrait_options = {size: cfg.portraitSize, eye_line: cfg.eyeLine, bleed: FINAL_BLEED_PX};
+        if (cfg.portraits && !portraitCount) runCtx.portraitSolutions = {};
+        var matched = afApi.sendPayload('match', matchPayload, MATCH_DELAY);
         if (!matched || !matched.assignments) throw new Error('Python returned an invalid frame-matching response.');
+        if (cfg.portraits && matched.portrait_layout) storePortraitPlacements(matched.portrait_layout);
         runCtx.assignments = {};
         for (var mi = 0; mi < matched.assignments.length; mi++) {
             runCtx.assignments[String(matched.assignments[mi].subject_id)] = matched.assignments[mi].frame_id;
@@ -865,6 +896,47 @@ function validateAssignments(assignments, subjects) {
         if (missingByColor[c] > allowed) {
             throw new Error(L(str.errMatching) + ': ' + firstUnexpected);
         }
+    }
+}
+
+function frameForSubject(subject) {
+    if (runCtx.allClippedAtStart) {
+        var meta = runCtx.layerMeta[String(subject.id)];
+        return meta && meta.clippingBaseId ? runCtx.framesById[String(meta.clippingBaseId)] : null;
+    }
+    if (runCtx.selectedFallback) return runCtx.frames.length ? runCtx.frames[0] : null;
+    return runCtx.assignments && runCtx.assignments[String(subject.id)] != undefined ?
+        runCtx.framesById[String(runCtx.assignments[String(subject.id)])] : null;
+}
+
+function preparePortraitPlacements() {
+    if (cfg.engine != 'python' || !cfg.portraits || runCtx.portraitSolutions) return;
+    var items = [], i, subject, frame;
+    runCtx.portraitSolutions = {};
+    for (i = 0; i < runCtx.subjects.length; i++) {
+        subject = runCtx.subjects[i]; frame = frameForSubject(subject);
+        if (!frame || usesLayerBoundsPlacement(subject)) continue;
+        if (!subject.portrait) continue;
+        items.push({ id: subject.id, portrait: subject.portrait, layer: subject.layer,
+            frame: {left: frame.left, top: frame.top, width: frame.width, height: frame.height},
+            top: frame.vertical ? cfg.vTop : cfg.hTop });
+    }
+    if (items.length) {
+        app.changeProgressText(L(str.portraitSolve));
+        var result = afApi.sendPayload('portrait_layout', {items: items,
+            size: cfg.portraitSize, eye_line: cfg.eyeLine, bleed: FINAL_BLEED_PX}, MATCH_DELAY);
+        storePortraitPlacements(result);
+    }
+}
+
+function storePortraitPlacements(result) {
+    if (!result || !result.solutions) throw new Error('Invalid portrait composition response.');
+    runCtx.portraitSolutions = {};
+    for (var i = 0; i < result.solutions.length; i++) {
+        var solution = result.solutions[i];
+        if (!isFiniteNumber(Number(solution.scale)) || !(Number(solution.scale) > 0) ||
+            !isFiniteNumber(Number(solution.tx)) || !isFiniteNumber(Number(solution.ty))) throw new Error('Invalid portrait transform.');
+        runCtx.portraitSolutions[String(solution.id)] = solution;
     }
 }
 
@@ -918,7 +990,7 @@ function alignSubjectInPlace(subject, frame) {
 }
 
 function moveAndAlignSubject(subject, frame) {
-    var offset = doc.getProperty('hasBackgroundLayer') ? 1 : 0,
+    var offset = runCtx.stackIndexOffset,
         subjectIdx = lr.getProperty('itemIndex', false, subject.id) - offset,
         frameIdx = lr.getProperty('itemIndex', false, frame.id) - offset;
 
@@ -1137,22 +1209,62 @@ function dialog(actionMode) {
         chFaceCount = pnEngine.add('checkbox'),
         stDesc = pnEngine.add("statictext{properties:{multiline:true},preferredSize:[390,72]}"),
         pnMargins = dlg.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:6,margins:[10,18,10,10]}"),
-        stVertical = pnMargins.add('statictext'),
-        rowVT = addSliderRow(pnMargins, L(str.topOffset), 0, 20, cfg.vTop),
-        rowVB = addSliderRow(pnMargins, L(str.bottomOffset), 0, 20, cfg.vBottom),
-        rowVS = addSliderRow(pnMargins, L(str.sideOffset), 0, 20, cfg.vSide),
-        stHorizontal = pnMargins.add('statictext'),
-        rowHT = addSliderRow(pnMargins, L(str.topOffset), 0, 20, cfg.hTop),
-        rowHB = addSliderRow(pnMargins, L(str.bottomOffset), 0, 20, cfg.hBottom),
-        rowHS = addSliderRow(pnMargins, L(str.sideOffset), 0, 20, cfg.hSide),
+        marginColumns = pnMargins.add("group{orientation:'row',alignChildren:['fill','top'],spacing:18}"),
+        marginVertical = marginColumns.add("group{orientation:'column',alignChildren:['fill','top'],spacing:6}"),
+        marginHorizontal = marginColumns.add("group{orientation:'column',alignChildren:['fill','top'],spacing:6}"),
+        stVertical = marginVertical.add('statictext'),
+        rowVT = addSliderRow(marginVertical, L(str.topOffset), 0, 20, cfg.vTop),
+        rowVB = addSliderRow(marginVertical, L(str.bottomOffset), 0, 20, cfg.vBottom),
+        rowVS = addSliderRow(marginVertical, L(str.sideOffset), 0, 20, cfg.vSide),
+        stHorizontal = marginHorizontal.add('statictext'),
+        rowHT = addSliderRow(marginHorizontal, L(str.topOffset), 0, 20, cfg.hTop),
+        rowHB = addSliderRow(marginHorizontal, L(str.bottomOffset), 0, 20, cfg.hBottom),
+        rowHS = addSliderRow(marginHorizontal, L(str.sideOffset), 0, 20, cfg.hSide),
+        pnPortrait = dlg.add("panel{orientation:'column',alignChildren:['fill','top'],spacing:6,margins:[10,18,10,10]}"),
+        chPortrait = pnPortrait.add('checkbox'),
+        portraitContent = pnPortrait.add("group{orientation:'row',alignChildren:['left','top'],spacing:12}"),
+        portraitControls = portraitContent.add("group{orientation:'column',alignChildren:['fill','top'],spacing:6}"),
+        rowPortraitSize = addSliderRow(portraitControls, L(str.portraitSize), 8, 50, cfg.portraitSize),
+        rowEyeLine = addSliderRow(portraitControls, L(str.eyeLine), 5, 85, cfg.eyeLine),
+        portraitDiagram = portraitContent.add('panel'),
+        portraitHelp = pnPortrait.add("statictext{properties:{multiline:true},preferredSize:[390,45]}"),
         buttons = dlg.add("group{orientation:'row',alignment:['center','top'],spacing:10}"),
-        ok = buttons.add('button', undefined, actionMode ? L(str.save) : L(str.okButton), { name: 'ok' }),
-        cancel = buttons.add('button', undefined, L(str.cancel), { name: 'cancel' });
+        ok = buttons.add('button', undefined, actionMode ? L(str.save) : L(str.okButton));
+
+    dlg.defaultElement = ok;
+    ok.onClick = function () { dlg.close(1); };
+    // Without a Cancel button, explicitly reserve Escape for cancellation;
+    // it must never activate the sole/default Run button.
+    dlg.addEventListener('keydown', function (event) {
+        if (event.keyName == 'Escape' || event.keyName == 'Esc') {
+            event.preventDefault();
+            event.stopPropagation();
+            dlg.close(2);
+        }
+    }, true);
 
     dlg.text = L(str.title) + ' ' + SCRIPT_VERSION;
     pnEngine.text = L(str.enginePanel);
     chFaceCount.text = L(str.useFaceCount);
     chFaceCount.value = !!cfg.useFaceCount;
+    pnPortrait.text = L(str.portraitPanel);
+    chPortrait.text = L(str.portraitEnable);
+    chPortrait.value = !!cfg.portraits;
+    portraitHelp.text = L(str.portraitHelp);
+    rowPortraitSize.slider.preferredSize = rowEyeLine.slider.preferredSize = [260, -1];
+    var marginRows = [rowVT,rowVB,rowVS,rowHT,rowHB,rowHS];
+    for (var mr = 0; mr < marginRows.length; mr++) marginRows[mr].slider.preferredSize = [185,-1];
+    portraitDiagram.preferredSize = [100, 95];
+    portraitDiagram.onDraw = function () {
+        var g = this.graphics, pen = g.newPen(g.PenType.SOLID_COLOR, [.55,.55,.55,1], 1),
+            blue = g.newPen(g.PenType.SOLID_COLOR, [.2,.6,.9,1], 1),
+            x = 17, y = 5, w = 64, h = 80,
+            eye = y + h * cfg.eyeLine / 100,
+            unit = h * cfg.portraitSize / 100;
+        g.newPath(); g.rectPath(x, y, w, h); g.strokePath(pen);
+        g.newPath(); g.ellipsePath(x + w/2 - unit*.62, eye-unit*.65, unit*1.24, unit*1.65); g.strokePath(pen);
+        g.newPath(); g.moveTo(x-12, eye); g.lineTo(x+w+12, eye); g.strokePath(blue);
+    };
     pnMargins.text = L(str.offsetPanel);
     stVertical.text = L(str.verticalFrame);
     stHorizontal.text = L(str.horizontalFrame);
@@ -1172,6 +1284,9 @@ function dialog(actionMode) {
     function updateEngineUI() {
         var key = dlEngine.selection ? dlEngine.selection.engineKey : cfg.engine,
             pythonMode = key == 'python';
+        pnPortrait.visible = pythonMode;
+        pnPortrait.enabled = pythonMode;
+        rowPortraitSize.enabled = rowEyeLine.enabled = portraitDiagram.enabled = pythonMode && !!cfg.portraits;
         chFaceCount.visible = pythonMode;
         chFaceCount.enabled = pythonMode;
         stDesc.text = engineDescription(key);
@@ -1192,6 +1307,21 @@ function dialog(actionMode) {
         cfg.useFaceCount = !!this.value;
     };
 
+    chPortrait.onClick = function () { cfg.portraits = !!this.value; updateEngineUI(); };
+    var lastPortraitDiagramState = '';
+    function redrawPortraitDiagram() {
+        var state = cfg.portraitSize + ':' + cfg.eyeLine;
+        if (state == lastPortraitDiagramState || !portraitDiagram.visible) return;
+        lastPortraitDiagramState = state;
+        // notify('onDraw') does not invalidate a native Photoshop panel.
+        // Invalidate only this small control, then flush the dialog's pending
+        // paint events while onChanging still owns the slider focus.
+        portraitDiagram.hide();
+        portraitDiagram.show();
+        try { dlg.update(); } catch (updateError) { }
+    }
+    bindSlider(rowPortraitSize, function (v) { cfg.portraitSize = v; redrawPortraitDiagram(); });
+    bindSlider(rowEyeLine, function (v) { cfg.eyeLine = v; redrawPortraitDiagram(); });
     bindSlider(rowVT, function (v) { cfg.vTop = v; });
     bindSlider(rowVB, function (v) { cfg.vBottom = v; });
     bindSlider(rowVS, function (v) { cfg.vSide = v; });
@@ -1236,6 +1366,9 @@ function Config() {
     var settingsObj = this;
     this.engine = '';
     this.useFaceCount = true;
+    this.portraits = false;
+    this.portraitSize = 22;
+    this.eyeLine = 35;
     // Defaults exactly reproduce the original hard-coded margins.
     this.vTop = 5;
     this.vBottom = 10;
@@ -1287,7 +1420,7 @@ function Config() {
 
         function objectToDescriptor(o) {
             var desc = new ActionDescriptor(),
-                keys = ['engine', 'useFaceCount', 'vTop', 'vBottom', 'vSide', 'hTop', 'hBottom', 'hSide'];
+                keys = ['engine', 'useFaceCount', 'portraits', 'portraitSize', 'eyeLine', 'vTop', 'vBottom', 'vSide', 'hTop', 'hBottom', 'hSide'];
 
             for (var i = 0; i < keys.length; i++) {
                 var key = keys[i], id = app.stringIDToTypeID(key), value = o[key];
@@ -1302,6 +1435,13 @@ function Config() {
     };
 }
 function Locale() {
+    this.portraitPanel = { ru: 'Одиночные портреты', en: 'Single-person portraits' };
+    this.portraitEnable = { ru: 'Согласовать крупность и линию глаз', en: 'Match face size and eye level' };
+    this.portraitSize = { ru: 'Глаза–подбородок, %', en: 'Eyes to chin, % of frame height' };
+    this.eyeLine = { ru: 'Линия глаз от верха, %', en: 'Eye level from frame top, %' };
+    this.portraitHelp = { ru: 'Меньше — общий план, больше — крупный. Оба значения — проценты высоты рамки. При нехватке исходного кадра общая композиция корректируется.', en: 'Smaller means a wider view, larger means a closer view. Both values are percentages of frame height. Original crops may require a common adjustment.' };
+    this.portraitSolve = { ru: 'Согласование портретов...', en: 'Matching portrait composition...' };
+
     this.prepareLayers = { ru: 'Подготовка слоёв...', en: 'Preparing layers...' };
     this.title = { ru: 'Выравнивание и вписывание', en: 'Align and fit layers' };
     this.err = { ru: 'Скрипт остановлен', en: 'Script stopped' };
@@ -1479,6 +1619,22 @@ function exportLayerPreview(sourceDoc, id, index, tempFiles) {
     } finally {
         try { app.activeDocument = sourceDoc; } catch (ignore3) { }
     }
+}
+
+// The JPEG path is already technical. Photoshop also derives the temporary
+// PSB document name from the source layer BEFORE JPEG export. Guard that name
+// only when unsafe, so ordinary layers incur no extra Action Manager call.
+function unsafeTemporaryLayerName(name) {
+    name = String(name == undefined ? '' : name);
+    return !name.length || name.length > 120 ||
+        /[\x00-\x1f\x7f-\x9f<>:"\/\\|?*\u00ad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/.test(name) ||
+        /[. ]$/.test(name) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name);
+}
+
+function protectTemporarySmartObjectName(id, name) {
+    if (!unsafeTemporaryLayerName(name)) return;
+    lr.setName('AlignFitPreview_' + id);
+    // The existing common preview history rollback restores the original name.
 }
 
 function convertActiveLayerToSmartObject() {
@@ -1982,6 +2138,14 @@ function placementCompositionCost(solution, frame) {
 }
 
 function alignLayer(subject, frame) {
+    var portrait = runCtx.portraitSolutions ? runCtx.portraitSolutions[String(subject.id)] : null;
+    if (portrait) {
+        var anchor = subject.portrait.eye, layer = subject.layer,
+            targetX = Number(portrait.tx) + Number(portrait.scale) * (anchor[0] - Number(layer.left)),
+            targetY = Number(portrait.ty) + Number(portrait.scale) * (anchor[1] - Number(layer.top));
+        lr.transform(targetX - anchor[0], targetY - anchor[1], Number(portrait.scale) * 100, anchor[0], anchor[1]);
+        return;
+    }
     var solution = getObjectPlacementSolution(subject, frame);
     if (!solution) throw new Error('Invalid object/frame geometry.');
 
@@ -2059,6 +2223,13 @@ function AM(target, order) {
         if (add) { d.putEnumerated(s2t('selectionModifier'), s2t('selectionModifierType'), s2t('addToSelection')) }
         d.putBoolean(s2t('makeVisible'), false)
         executeAction(s2t('select'), d, DialogModes.NO)
+    }
+    this.setName = function (name) {
+        (r = new ActionReference()).putEnumerated(s2t('layer'), s2t('ordinal'), s2t('targetEnum'));
+        (d = new ActionDescriptor()).putReference(s2t('null'), r);
+        (d1 = new ActionDescriptor()).putString(s2t('name'), name);
+        d.putObject(s2t('to'), s2t('layer'), d1);
+        executeAction(s2t('set'), d, DialogModes.NO);
     }
     this.moveLayer = function (from, to) {
         (r = new ActionReference()).putIndex(s2t('layer'), from);
