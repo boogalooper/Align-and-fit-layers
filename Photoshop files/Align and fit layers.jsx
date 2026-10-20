@@ -17,7 +17,7 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.7.7',
+var SCRIPT_VERSION = '0.7.9',
     SCRIPT_NAME = 'Align and fit layers',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
@@ -25,7 +25,7 @@ var SCRIPT_VERSION = '0.7.7',
     API_PORT_LISTEN = 6321,
     API_FILES = ['lib/align-fit-api.pyw', 'align-fit-api.pyw'],
     RUNTIME_NAME = 'AlignFitRuntime',
-    EXPECTED_SERVER_VERSION = '0.6.0',
+    EXPECTED_SERVER_VERSION = '0.6.2',
     PREVIEW_MAX = 1280,
     FINAL_BLEED_PX = 2,
     INIT_DELAY = 15000,
@@ -115,9 +115,9 @@ function runScript() {
     var runError = null;
     try {
         cleanupStaleTempFiles();
-        app.doProgressSegmentTask(10, 0, 100, 'prepareRunContextStage();');
+        if (app.doProgressSegmentTask(10, 0, 100, 'prepareRunContextStage();') === false) throw makeUserCancelError();
 
-        app.doProgressSegmentTask(90, 10, 100, 'runPreparedStages();');
+        if (app.doProgressSegmentTask(90, 10, 100, 'runPreparedStages();') === false) throw makeUserCancelError();
         app.changeProgressText(L(str.done));
         app.updateProgress(100, 100);
     } catch (e) {
@@ -162,8 +162,8 @@ function runPreparedStages() {
 
             // Preview generation is one history step and one Undo, so the source
             // layers/clipping stack return exactly to the pre-analysis state.
-            app.doProgressSegmentTask(28, 0, 100, 'preparePythonStage();');
-            app.doProgressSegmentTask(4, 28, 100, 'analyzePythonStage();');
+            if (app.doProgressSegmentTask(28, 0, 100, 'preparePythonStage();') === false) throw makeUserCancelError();
+            if (app.doProgressSegmentTask(4, 28, 100, 'analyzePythonStage();') === false) throw makeUserCancelError();
             runCtx.subjectSegmentStart = 32;
             runCtx.frameSegmentStart = 44;
             runCtx.matchSegmentStart = 64;
@@ -173,7 +173,7 @@ function runPreparedStages() {
 
             // Measure Select Subject inside the layer's own temporary Smart Object.
             // No JPEG export and no resize are used for Photoshop autoCutout modes.
-            app.doProgressSegmentTask(35, 0, 100, 'prepareAutoCutoutStage();');
+            if (app.doProgressSegmentTask(35, 0, 100, 'prepareAutoCutoutStage();') === false) throw makeUserCancelError();
             runCtx.subjectSegmentStart = 35;
             runCtx.frameSegmentStart = 45;
             runCtx.matchSegmentStart = 65;
@@ -209,6 +209,8 @@ function createRunContext() {
         layerMeta[String(mid)] = {
             name: info.name,
             color: info.color,
+            visible: info.visible,
+            smartObject: info.smartObject,
             clipped: isClipped,
             clippingBaseId: null
         };
@@ -362,7 +364,7 @@ function preparePythonPreviewsLoop() {
     var n = runCtx.subjectTargetIds.length,
         slice = 1 / Math.max(1, n);
     for (var i = 0; i < n; i++) {
-        app.doProgressTask(slice, 'preparePythonPreviewChunk(' + i + ');');
+        if (app.doProgressTask(slice, 'preparePythonPreviewChunk(' + i + ');') === false) throw makeUserCancelError();
     }
 }
 
@@ -373,7 +375,7 @@ function preparePythonPreviewChunk(i) {
         text = L(str.prepareImages) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' — ' + name;
     app.activeDocument = runCtx.sourceDoc;
     lr.selectLayer(id);
-    if (!lr.getProperty('visible')) lr.setLayerVisiblity(id, true);
+    if (!meta.visible) lr.setLayerVisiblity(id, true);
     runCtx.previewTouched = true;
     protectTemporarySmartObjectName(id, name);
     var preview = exportLayerPreview(runCtx.sourceDoc, id, i, runCtx.tempFiles);
@@ -435,7 +437,7 @@ function prepareAutoCutoutLoop() {
     var n = runCtx.subjectTargetIds.length,
         slice = 1 / Math.max(1, n);
     for (var i = 0; i < n; i++) {
-        app.doProgressTask(slice, 'prepareAutoCutoutChunk(' + i + ');');
+        if (app.doProgressTask(slice, 'prepareAutoCutoutChunk(' + i + ');') === false) throw makeUserCancelError();
     }
 }
 
@@ -446,7 +448,7 @@ function prepareAutoCutoutChunk(i) {
         text = L(str.detectBounds) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' — ' + name;
     app.activeDocument = runCtx.sourceDoc;
     lr.selectLayer(id);
-    if (!lr.getProperty('visible')) lr.setLayerVisiblity(id, true);
+    if (!meta.visible) lr.setLayerVisiblity(id, true);
     runCtx.previewTouched = true;
     var measured = measureAutoCutoutInSmartObject(runCtx.sourceDoc, id);
     // A layer on which Select Subject found nothing is not fatal. Keep a result
@@ -464,9 +466,7 @@ function measureAutoCutoutInSmartObject(sourceDoc, id) {
         stage = 'select source layer';
     try {
         app.displayDialogs = DialogModes.NO;
-        app.activeDocument = sourceDoc;
-        lr.selectLayer(id);
-
+        // The caller has already activated the document and selected this layer.
         protectTemporarySmartObjectName(id, runCtx.layerMeta[String(id)].name);
         stage = 'convert source layer to Smart Object';
         convertActiveLayerToSmartObject();
@@ -506,7 +506,6 @@ function measureAutoCutoutInSmartObject(sourceDoc, id) {
         stage = 'close Smart Object contents';
         doc.close(false);
         smartDoc = null;
-        app.activeDocument = sourceDoc;
         return out;
     } catch (e) {
         try {
@@ -516,7 +515,7 @@ function measureAutoCutoutInSmartObject(sourceDoc, id) {
                 smartDoc = null;
             }
         } catch (ignore0) { }
-        try { app.activeDocument = sourceDoc; } catch (ignore1) { }
+        if (e.number == 8007) throw e;
         throw new Error('autoCutout failed for layer ' + id + ' [' + stage + ']: ' + e.message);
     } finally {
         try { app.activeDocument = sourceDoc; } catch (ignore2) { }
@@ -552,19 +551,19 @@ function mainHistory() {
         m0 = runCtx.matchSegmentStart,
         a0 = runCtx.alignSegmentStart;
 
-    app.doProgressSegmentTask(f0 - s0, s0, 100, 'collectSubjectsStage();');
+    if (app.doProgressSegmentTask(f0 - s0, s0, 100, 'collectSubjectsStage();') === false) throw makeUserCancelError();
     prepareFrameList();
-    app.doProgressSegmentTask(m0 - f0, f0, 100, 'readFramesStage();');
-    app.doProgressSegmentTask(a0 - m0, m0, 100, 'matchFramesStage();');
+    if (app.doProgressSegmentTask(m0 - f0, f0, 100, 'readFramesStage();') === false) throw makeUserCancelError();
+    if (app.doProgressSegmentTask(a0 - m0, m0, 100, 'matchFramesStage();') === false) throw makeUserCancelError();
     preparePortraitPlacements();
-    app.doProgressSegmentTask(100 - a0, a0, 100, 'alignSubjectsStage();');
+    if (app.doProgressSegmentTask(100 - a0, a0, 100, 'alignSubjectsStage();') === false) throw makeUserCancelError();
 }
 
 function collectSubjectsStage() {
     var n = runCtx.subjectTargetIds.length,
         slice = 1 / Math.max(1, n);
     for (var i = 0; i < n; i++) {
-        app.doProgressTask(slice, 'collectSubjectChunk(' + i + ');');
+        if (app.doProgressTask(slice, 'collectSubjectChunk(' + i + ');') === false) throw makeUserCancelError();
     }
     runCtx.subjects.sort(function (a, b) { return a.ratio > b.ratio ? 1 : -1; });
 }
@@ -575,7 +574,6 @@ function collectSubjectChunk(i) {
         layerName = meta ? meta.name : lr.getProperty('name', false, id),
         text = L(str.detectBounds) + ': ' + (i + 1) + '/' + runCtx.subjectTargetIds.length + ' — ' + layerName;
 
-    doc.selectLayer(id);
     // Read live bounds only after preview history has been restored.
     var descriptor = lr.getDescriptor(id), layerBounds;
     if (!descriptor.getBoolean(stringIDToTypeID('visible'))) {
@@ -614,7 +612,7 @@ function collectSubjectChunk(i) {
         if (!subject) throw new Error(L(str.errLayerBounds) + ': ' + layerName);
     }
 
-    subject.color = meta ? meta.color : lr.getProperty('color')[1];
+    subject.color = meta ? meta.color : lr.getProperty('color', false, id)[1];
     subject.id = id;
     runCtx.subjects.push(subject);
     app.changeProgressText(text);
@@ -649,6 +647,7 @@ function subjectFromLocalAnalysis(id, analysis, fromPython, layerBounds) {
             subject.portrait = {
                 eye: [Number(layerBounds.left) + Number(p.eye[0]) * sx, Number(layerBounds.top) + Number(p.eye[1]) * sy],
                 metrics: metrics,
+                head: p.head > 0 ? Number(p.head) * metricScale : 0,
                 head_top: Number(layerBounds.top) + Number(p.head_top) * sy,
                 head_left: Number(layerBounds.left) + Number(p.head_left) * sx,
                 head_right: Number(layerBounds.left) + Number(p.head_right) * sx,
@@ -703,6 +702,8 @@ function LayerMetadataCache() {
             info.name = d.getString(s2t('name'));
             info.color = typeIDToStringID(d.getEnumerationValue(s2t('color')));
             info.clipped = d.getBoolean(s2t('group'));
+            info.visible = d.getBoolean(s2t('visible'));
+            info.smartObject = d.hasKey(s2t('smartObject'));
             info.index = d.getInteger(s2t('itemIndex')) - backgroundOffset;
             ids[String(info.id)] = info;
             indices[String(info.index)] = info;
@@ -778,7 +779,7 @@ function readFramesStage() {
         app.changeProgressText(L(str.readFrames) + ': 0/0');
         return;
     }
-    for (var i = 0; i < n; i++) app.doProgressTask(slice, 'readFrameChunk(' + i + ');');
+    for (var i = 0; i < n; i++) if (app.doProgressTask(slice, 'readFrameChunk(' + i + ');') === false) throw makeUserCancelError();
     runCtx.frames.sort(function (a, b) { return a.ratio > b.ratio ? 1 : -1; });
 }
 
@@ -942,7 +943,7 @@ function storePortraitPlacements(result) {
 function alignSubjectsStage() {
     var n = runCtx.subjects.length,
         slice = 1 / Math.max(1, n);
-    for (var i = 0; i < n; i++) app.doProgressTask(slice, 'alignSubjectChunk(' + i + ');');
+    for (var i = 0; i < n; i++) if (app.doProgressTask(slice, 'alignSubjectChunk(' + i + ');') === false) throw makeUserCancelError();
 }
 
 function alignSubjectChunk(i) {
@@ -1300,15 +1301,19 @@ function dialog(actionMode) {
     function updateEngineUI() {
         var key = dlEngine.selection ? dlEngine.selection.engineKey : cfg.engine,
             pythonMode = key == 'python';
-        if (!portraitDiagram.image) portraitDiagram.image = getPortraitPreviewBitmap();
-        pnPortrait.enabled = pythonMode;
-        rowPortraitSize.enabled = rowPortraitTop.enabled = portraitDiagram.enabled = pythonMode && !!cfg.portraits;
         chFaceCount.visible = pythonMode;
         chFaceCount.enabled = pythonMode;
         stDesc.text = engineDescription(key);
         pnMargins.enabled = key != 'layer';
         pnEngine.layout.layout(true);
         dlg.layout.layout(true);
+        updatePortraitUI(pythonMode);
+    }
+    function updatePortraitUI(pythonMode) {
+        var active = pythonMode && !!cfg.portraits;
+        pnPortrait.enabled = pythonMode;
+        rowPortraitSize.enabled = rowPortraitTop.enabled = portraitDiagram.enabled = active;
+        if (!portraitDiagram.image) portraitDiagram.image = active ? getPortraitPreviewBitmap() : getDisabledPortraitPreviewBitmap();
         redrawPortraitDiagram();
     }
 
@@ -1324,7 +1329,7 @@ function dialog(actionMode) {
         cfg.useFaceCount = !!this.value;
     };
 
-    chPortrait.onClick = function () { cfg.portraits = !!this.value; updateEngineUI(); };
+    chPortrait.onClick = function () { cfg.portraits = !!this.value; updatePortraitUI(cfg.engine == 'python'); };
     function redrawPortraitDiagram() {
         var state = cfg.portraitSize + ':' + cfg.portraitTop + ':' + portraitDiagram.enabled;
         if (state == lastPortraitDiagramState || !portraitDiagram.visible) return;
@@ -1489,8 +1494,8 @@ function Locale() {
     this.portraitSize = { ru: 'Масштаб портрета', en: 'Portrait size' };
     this.portraitSizeHelp = { ru: 'Числовое значение масштаба для точного повторения настройки. Картинка обновляется после отпускания ползунка.', en: 'Numeric portrait size for repeatable settings. The image updates when you release the slider.' };
     this.portraitDirection = { ru: 'Общий план  ← →  Крупный план', en: 'Wider view  ← →  Closer view' };
-    this.portraitTop = { ru: 'Отступ над головой, %', en: 'Space above head, %' };
-    this.portraitTopHelp = { ru: 'Минимальный отступ над головой, в процентах высоты рамки. Используется только для одиночных портретов.', en: 'Minimum space above the head as a percentage of frame height. Applies only to single-person portraits.' };
+    this.portraitTop = { ru: 'Мин. отступ над головой, %', en: 'Min. space above head, %' };
+    this.portraitTopHelp = { ru: 'Минимальный отступ в процентах высоты рамки. Для общей линии глаз и перекрытия рамки фактическое поле может быть больше.', en: 'Minimum space as a percentage of frame height. The actual gap may be larger to align eyes and cover the frame.' };
     this.portraitPreviewHelp = { ru: 'Пример кадрирования. Зелёная линия — минимальный отступ сверху, синяя — автоматически рассчитанная высота глаз. Реальное размещение учитывает все выбранные портреты.', en: 'Framing example. Green marks the minimum top margin; blue marks automatic eye height. Actual placement accounts for all selected portraits.' };
     this.portraitHelp = { ru: 'Масштаб и высота глаз согласуются автоматически. Отступ над головой — отдельный для портретов. Схема показывает пример, а не результат анализа ваших фотографий.', en: 'Face size and eye height are coordinated automatically. Portraits have their own head margin. The illustration is an example, not an analysis of your photos.' };
     this.portraitSolve = { ru: 'Согласование портретов...', en: 'Matching portrait composition...' };
@@ -1592,7 +1597,7 @@ function exportLayerPreview(sourceDoc, id, index, tempFiles) {
         // Smart Object whose contents Photoshop must repeatedly render while
         // resizing/exporting the temporary preview. The source state is restored
         // by the single history rollback after the whole preview pass.
-        if (lr.hasProperty('smartObject')) {
+        if (runCtx.layerMeta[String(id)].smartObject) {
             stage = 'rasterize existing Smart Object for preview';
             lr.rasterize();
         }
@@ -1646,7 +1651,6 @@ function exportLayerPreview(sourceDoc, id, index, tempFiles) {
         stage = 'close Smart Object contents';
         doc.close(false);
         smartDoc = null;
-        app.activeDocument = sourceDoc;
         return out;
     } catch (e) {
         try {
@@ -1656,8 +1660,8 @@ function exportLayerPreview(sourceDoc, id, index, tempFiles) {
                 smartDoc = null;
             }
         } catch (ignore0) { }
-        try { app.activeDocument = sourceDoc; } catch (ignore1) { }
         try { if (file && file.exists) file.remove(); } catch (ignore2) { }
+        if (e.number == 8007) throw e;
         throw new Error('Cannot create JPEG preview for layer ' + id + ' [' + stage + ']: ' + e.message);
     } finally {
         try { app.activeDocument = sourceDoc; } catch (ignore3) { }
@@ -2346,6 +2350,7 @@ function AM(target, order) {
         try {
             executeAction(s2t('transform'), d, DialogModes.NO);
         } catch (transformError) {
+            if (transformError.number == 8007) throw transformError;
             var info = [];
             try { info.push('layerID=' + lr.getProperty('layerID')); } catch (e0) { }
             try { info.push('name=' + lr.getProperty('name')); } catch (e1) { }
@@ -2587,70 +2592,85 @@ function analysisApi(apiHost, portSend, portListen, apiFile, runtime) {
             listener = null,
             t1 = 0,
             t2 = 0,
-            t3 = 0;
+            t3 = 0,
+            sent = false,
+            received = false;
         o.request_id = requestId;
 
-        if (getData) {
-            listener = new Socket();
-            if (!listener.listen(portListen, 'UTF-8')) return null;
-            t1 = t3 = (new Date()).getTime();
-        }
-
-        if (sendData) {
-            var sender = new Socket();
-            if (sender.open(apiHost + ':' + portSend, 'UTF-8')) {
-                sender.writeln(objectToJSON(o));
-                sender.close();
-            } else {
-                if (listener) listener.close();
-                return null;
-            }
-        }
-
-        if (!getData) return true;
-        for (;;) {
-            t2 = (new Date()).getTime();
-            if (t2 - t1 > delay) {
-                if (listener) listener.close();
-                return null;
+        try {
+            if (getData) {
+                listener = new Socket();
+                if (!listener.listen(portListen, 'UTF-8')) return null;
+                t1 = t3 = (new Date()).getTime();
             }
 
-            // app.updateProgress() does not advance a nested
-            // app.doProgressSegmentTask() reliably. Use the same pattern as the
-            // API img2img helper: while polling the socket, repeatedly add a small
-            // doProgressTask() slice to the *current* analysis segment. The
-            // exponential curve approaches 95% of the segment and leaves its end
-            // for the actual Python reply.
-            if (animateProgress && t2 - t3 >= API_POLL_INTERVAL) {
-                var progressDelta = t2 - t3,
-                    slice = progressDelta > 0
-                        ? 1 - Math.pow(1 - PROGRESS_STAGE_TARGET, progressDelta / PYTHON_ANALYZE_EXPECTED_MS)
-                        : 0;
-                if (slice > 0 && !app.doProgressTask(slice, 'pythonAnalysisProgressChunk();')) {
-                    if (listener) listener.close();
-                    var cancelError = new Error('User cancelled');
-                    cancelError.number = 8007;
-                    throw cancelError;
+            if (sendData) {
+                var sender = new Socket();
+                try {
+                    if (!sender.open(apiHost + ':' + portSend, 'UTF-8')) return null;
+                    sent = sender.writeln(objectToJSON(o));
+                    if (!sent) return null;
+                } finally {
+                    sender.close();
                 }
-                t3 = t2;
             }
 
-            var answer = listener.poll();
-            if (answer != null) {
-                var a = null;
-                try { a = eval('(' + answer.readln() + ')'); } catch (e) { a = null; }
-                try { answer.close(); } catch (e2) { }
+            if (!getData) return true;
+            for (;;) {
+                t2 = (new Date()).getTime();
+                if (t2 - t1 > delay) {
+                    return null;
+                }
 
-                // Ignore delayed replies from an older request. A legacy handshake
-                // without request_id is accepted only to detect/stop an old server.
-                var legacyHandshake = o.type == 'handshake' && a && a.request_id == undefined;
-                if (a && !legacyHandshake && String(a.request_id) != requestId) continue;
-                if (!a) continue;
+                // app.updateProgress() does not advance a nested
+                // app.doProgressSegmentTask() reliably. Use the same pattern as the
+                // API img2img helper: while polling the socket, repeatedly add a small
+                // doProgressTask() slice to the *current* analysis segment. The
+                // exponential curve approaches 95% of the segment and leaves its end
+                // for the actual Python reply.
+                if (animateProgress && t2 - t3 >= API_POLL_INTERVAL) {
+                    var progressDelta = t2 - t3,
+                        slice = progressDelta > 0
+                            ? 1 - Math.pow(1 - PROGRESS_STAGE_TARGET, progressDelta / PYTHON_ANALYZE_EXPECTED_MS)
+                            : 0;
+                    if (slice > 0 && app.doProgressTask(slice, 'pythonAnalysisProgressChunk();') === false) {
+                        throw makeUserCancelError();
+                    }
+                    t3 = t2;
+                }
 
-                if (listener) listener.close();
-                return a;
+                var answer = listener.poll();
+                if (answer != null) {
+                    var a = null;
+                    try { a = eval('(' + answer.readln() + ')'); } catch (e) { a = null; }
+                    try { answer.close(); } catch (e2) { }
+
+                    // Ignore delayed replies from an older request. A legacy handshake
+                    // without request_id is accepted only to detect/stop an old server.
+                    var legacyHandshake = o.type == 'handshake' && a && a.request_id == undefined;
+                    if (a && !legacyHandshake && String(a.request_id) != requestId) continue;
+                    if (!a) continue;
+
+                    received = true;
+                    return a;
+                }
+                $.sleep(animateProgress ? API_POLL_SLEEP : 1);
             }
-            $.sleep(animateProgress ? API_POLL_SLEEP : 1);
+        } finally {
+            try { if (listener) listener.close(); } catch (closeError) { }
+            if (sent && getData && o.type == 'analyze' && !received) cancelAnalysis(requestId);
+        }
+    }
+
+    function cancelAnalysis(requestId) {
+        var sender = new Socket();
+        try {
+            sender.timeout = 1;
+            if (sender.open(apiHost + ':' + portSend, 'UTF-8')) {
+                sender.writeln(objectToJSON({type: 'cancel', message: {request_id: requestId}}));
+            }
+        } catch (cancelError) { } finally {
+            try { sender.close(); } catch (closeError) { }
         }
     }
 

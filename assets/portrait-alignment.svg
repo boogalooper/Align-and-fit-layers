@@ -1,65 +1,75 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="950" height="460" viewBox="0 0 950 460" role="img" aria-labelledby="title desc">
-<title id="title">Одинаковая крупность портретов и согласованная линия глаз</title>
-<desc id="desc">Слева лица разного размера и на разной высоте. Справа лица согласованы по крупности, а середины глаз находятся на 35 процентах высоты рамок. Если один исходник требует большего увеличения, крупность корректируется совместно.</desc>
-<defs><style>text{font-family:Arial,DejaVu Sans,sans-serif;fill:#303940}.heading{font-size:19px;font-weight:bold}.label{font-size:14px}.note{font-size:15px}.frame{fill:#e4efee;stroke:#437d7a;stroke-width:2}</style></defs>
-<rect width="950" height="460" rx="12" fill="#f6f7f9"/>
-<text x="238" y="35" text-anchor="middle" class="heading">Разное исходное кадрирование</text>
-<text x="712" y="35" text-anchor="middle" class="heading">Общая крупность и линия глаз</text>
-<rect x="22" y="52" width="432" height="280" rx="8" fill="white" stroke="#ccd8dc"/>
-<rect x="496" y="52" width="432" height="280" rx="8" fill="white" stroke="#ccd8dc"/>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="950" height="820" viewBox="0 0 950 820" role="img" aria-labelledby="title desc">
+<title id="title">Масштаб и отступ над головой в портретном режиме</title>
+<desc id="desc">На портрете из окна скрипта показаны три значения масштаба при одинаковом верхнем отступе и три значения отступа при одинаковом масштабе. Зелёная линия обозначает минимальный верхний отступ, синяя — положение глаз. Рамки остаются неподвижными.</desc>
+<defs>
+<style>text{font-family:Arial,DejaVu Sans,sans-serif;fill:#303940}.heading{font-size:21px;font-weight:bold}.label{font-size:17px;font-weight:bold}.note{font-size:15px}.small{font-size:14px;fill:#637278}</style>
 
-<clipPath id="clip0"><rect x="56" y="90" width="104" height="180"/></clipPath>
-<rect x="56" y="90" width="104" height="180" rx="3" class="frame"/>
-<g clip-path="url(#clip0)">
-<path d="M64.8 285 L72.0 191.51999999999998 Q108.0 164.16 144.0 191.51999999999998 L151.2 285 Z" fill="#70aaa7"/>
-<ellipse cx="108.0" cy="147.6" rx="18.720000000000002" ry="25.2" fill="#70aaa7" stroke="#437d7a" stroke-width="1.5"/>
-<path d="M97.92 144.0 h3.456 M114.624 144.0 h3.456" stroke="#303940" stroke-width="2"/>
-</g>
-<path d="M52 144.0 h112" stroke="#87969b" stroke-width="1.5" stroke-dasharray="4 3"/>
-<clipPath id="clip1"><rect x="184" y="90" width="104" height="180"/></clipPath>
-<rect x="184" y="90" width="104" height="180" rx="3" class="frame"/>
-<g clip-path="url(#clip1)">
-<path d="M163.1 285 L175.25 249.39 Q236.0 203.21999999999997 296.75 249.39 L308.9 285 Z" fill="#70aaa7"/>
-<ellipse cx="236.0" cy="175.27499999999998" rx="31.590000000000003" ry="42.525" fill="#70aaa7" stroke="#437d7a" stroke-width="1.5"/>
-<path d="M218.99 169.2 h5.832 M247.178 169.2 h5.832" stroke="#303940" stroke-width="2"/>
-</g>
-<path d="M180 169.2 h112" stroke="#87969b" stroke-width="1.5" stroke-dasharray="4 3"/>
-<clipPath id="clip2"><rect x="312" y="90" width="104" height="180"/></clipPath>
-<rect x="312" y="90" width="104" height="180" rx="3" class="frame"/>
-<g clip-path="url(#clip2)">
-<path d="M307.3 285 L316.75 213.57 Q364.0 177.66 411.25 213.57 L420.7 285 Z" fill="#70aaa7"/>
-<ellipse cx="364.0" cy="155.92499999999998" rx="24.57" ry="33.074999999999996" fill="#70aaa7" stroke="#437d7a" stroke-width="1.5"/>
-<path d="M350.77 151.2 h4.536 M372.694 151.2 h4.536" stroke="#303940" stroke-width="2"/>
-</g>
-<path d="M308 151.2 h112" stroke="#87969b" stroke-width="1.5" stroke-dasharray="4 3"/>
-<clipPath id="clip3"><rect x="530" y="90" width="104" height="180"/></clipPath>
-<rect x="530" y="90" width="104" height="180" rx="3" class="frame"/>
-<g clip-path="url(#clip3)">
-<path d="M522.6 285 L532.5 218.34 Q582.0 180.72 631.5 218.34 L641.4 285 Z" fill="#70aaa7"/>
-<ellipse cx="582.0" cy="157.95" rx="25.740000000000002" ry="34.65" fill="#70aaa7" stroke="#437d7a" stroke-width="1.5"/>
-<path d="M568.14 153.0 h4.752 M591.108 153.0 h4.752" stroke="#303940" stroke-width="2"/>
-</g>
-<clipPath id="clip4"><rect x="658" y="90" width="104" height="180"/></clipPath>
-<rect x="658" y="90" width="104" height="180" rx="3" class="frame"/>
-<g clip-path="url(#clip4)">
-<path d="M650.6 285 L660.5 218.34 Q710.0 180.72 759.5 218.34 L769.4 285 Z" fill="#70aaa7"/>
-<ellipse cx="710.0" cy="157.95" rx="25.740000000000002" ry="34.65" fill="#70aaa7" stroke="#437d7a" stroke-width="1.5"/>
-<path d="M696.14 153.0 h4.752 M719.108 153.0 h4.752" stroke="#303940" stroke-width="2"/>
-</g>
-<clipPath id="clip5"><rect x="786" y="90" width="104" height="180"/></clipPath>
-<rect x="786" y="90" width="104" height="180" rx="3" class="frame"/>
-<g clip-path="url(#clip5)">
-<path d="M778.6 285 L788.5 218.34 Q838.0 180.72 887.5 218.34 L897.4 285 Z" fill="#70aaa7"/>
-<ellipse cx="838.0" cy="157.95" rx="25.740000000000002" ry="34.65" fill="#70aaa7" stroke="#437d7a" stroke-width="1.5"/>
-<path d="M824.14 153.0 h4.752 M847.108 153.0 h4.752" stroke="#303940" stroke-width="2"/>
-</g>
-<path d="M518 153 H906" stroke="#357bb0" stroke-width="2" stroke-dasharray="6 4"/>
-<text x="238" y="304" text-anchor="middle" class="label">Размер лица и высота глаз различаются</text>
-<text x="712" y="290" text-anchor="middle" class="label">Общая линия глаз — автоматически</text>
-<text x="712" y="312" text-anchor="middle" class="label">Крупность задаётся одним ползунком</text>
-<path d="M464 188 h20 m-6 -6 l6 6 -6 6" fill="none" stroke="#437d7a" stroke-width="2.5"/>
-<rect x="22" y="350" width="906" height="88" rx="8" fill="#e4efee"/>
-<text x="45" y="378" class="note" font-weight="bold">Если исходное кадрирование требует большей крупности — увеличиваются все портреты.</text>
-<text x="45" y="403" class="note">Линия глаз подбирается с учётом отдельного минимального отступа над головой.</text>
-<text x="45" y="426" class="label">Схема показывает принцип. Наклон головы и естественные пропорции лиц сохраняются.</text>
+<image id="portrait" width="160" height="240" xlink:href="data:image/png;base64,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"/>
+</defs>
+<rect width="950" height="820" rx="12" fill="#f6f7f9"/>
+<text x="24" y="36" class="heading">Портретный режим: масштаб и отступ над головой</text>
+<line x1="25" y1="62" x2="55" y2="62" stroke="#4d9966" stroke-width="2"/>
+<text x="65" y="67" class="note">минимальный отступ</text>
+<line x1="287" y1="62" x2="317" y2="62" stroke="#3399e6" stroke-width="2"/>
+<text x="327" y="67" class="note">линия глаз</text>
+<text x="24" y="103" class="label">Масштаб портрета</text>
+<text x="926" y="103" text-anchor="end" class="small">Отступ над головой — 5% во всех примерах</text>
+<rect x="24" y="120" width="290" height="286" rx="8" fill="white" stroke="#d8e0e3"/>
+<text x="169" y="148" text-anchor="middle" class="label">Масштаб 12%</text>
+<defs><clipPath id="clip-0-0"><rect x="99" y="164" width="140" height="190"/></clipPath></defs>
+<rect x="99" y="164" width="140" height="190" fill="#e4efee"/>
+<g clip-path="url(#clip-0-0)"><use xlink:href="#portrait" transform="translate(77.8000 165.5200) scale(1.140000)"/></g>
+<line x1="100" y1="173.5000" x2="238" y2="173.5000" stroke="#4d9966" stroke-width="2"/>
+<line x1="100" y1="202.0000" x2="238" y2="202.0000" stroke="#3399e6" stroke-width="2"/>
+<rect x="99" y="164" width="140" height="190" fill="none" stroke="#437d7a" stroke-width="1.5"/>
+<text x="169" y="384" text-anchor="middle" class="note">Более общий план</text>
+<rect x="330" y="120" width="290" height="286" rx="8" fill="white" stroke="#d8e0e3"/>
+<text x="475" y="148" text-anchor="middle" class="label">Масштаб 22%</text>
+<defs><clipPath id="clip-0-1"><rect x="405" y="164" width="140" height="190"/></clipPath></defs>
+<rect x="405" y="164" width="140" height="190" fill="#e4efee"/>
+<g clip-path="url(#clip-0-1)"><use xlink:href="#portrait" transform="translate(307.8000 158.8700) scale(2.090000)"/></g>
+<line x1="406" y1="173.5000" x2="544" y2="173.5000" stroke="#4d9966" stroke-width="2"/>
+<line x1="406" y1="225.7500" x2="544" y2="225.7500" stroke="#3399e6" stroke-width="2"/>
+<rect x="405" y="164" width="140" height="190" fill="none" stroke="#437d7a" stroke-width="1.5"/>
+<text x="475" y="384" text-anchor="middle" class="note">Средний план</text>
+<rect x="636" y="120" width="290" height="286" rx="8" fill="white" stroke="#d8e0e3"/>
+<text x="781" y="148" text-anchor="middle" class="label">Масштаб 32%</text>
+<defs><clipPath id="clip-0-2"><rect x="711" y="164" width="140" height="190"/></clipPath></defs>
+<rect x="711" y="164" width="140" height="190" fill="#e4efee"/>
+<g clip-path="url(#clip-0-2)"><use xlink:href="#portrait" transform="translate(537.8000 152.2200) scale(3.040000)"/></g>
+<line x1="712" y1="173.5000" x2="850" y2="173.5000" stroke="#4d9966" stroke-width="2"/>
+<line x1="712" y1="249.5000" x2="850" y2="249.5000" stroke="#3399e6" stroke-width="2"/>
+<rect x="711" y="164" width="140" height="190" fill="none" stroke="#437d7a" stroke-width="1.5"/>
+<text x="781" y="384" text-anchor="middle" class="note">Более крупный план</text>
+<text x="24" y="447" class="label">Минимальный отступ над головой</text>
+<text x="926" y="447" text-anchor="end" class="small">Масштаб — 22% во всех примерах</text>
+<rect x="24" y="464" width="290" height="286" rx="8" fill="white" stroke="#d8e0e3"/>
+<text x="169" y="492" text-anchor="middle" class="label">Отступ 0%</text>
+<defs><clipPath id="clip-1-0"><rect x="99" y="508" width="140" height="190"/></clipPath></defs>
+<rect x="99" y="508" width="140" height="190" fill="#e4efee"/>
+<g clip-path="url(#clip-1-0)"><use xlink:href="#portrait" transform="translate(1.8000 493.3700) scale(2.090000)"/></g>
+<line x1="100" y1="508.6000" x2="238" y2="508.6000" stroke="#4d9966" stroke-width="2"/>
+<line x1="100" y1="560.2500" x2="238" y2="560.2500" stroke="#3399e6" stroke-width="2"/>
+<rect x="99" y="508" width="140" height="190" fill="none" stroke="#437d7a" stroke-width="1.5"/>
+<text x="169" y="728" text-anchor="middle" class="note">Без свободного места сверху</text>
+<rect x="330" y="464" width="290" height="286" rx="8" fill="white" stroke="#d8e0e3"/>
+<text x="475" y="492" text-anchor="middle" class="label">Отступ 10%</text>
+<defs><clipPath id="clip-1-1"><rect x="405" y="508" width="140" height="190"/></clipPath></defs>
+<rect x="405" y="508" width="140" height="190" fill="#e4efee"/>
+<g clip-path="url(#clip-1-1)"><use xlink:href="#portrait" transform="translate(307.8000 512.3700) scale(2.090000)"/></g>
+<line x1="406" y1="527.0000" x2="544" y2="527.0000" stroke="#4d9966" stroke-width="2"/>
+<line x1="406" y1="579.2500" x2="544" y2="579.2500" stroke="#3399e6" stroke-width="2"/>
+<rect x="405" y="508" width="140" height="190" fill="none" stroke="#437d7a" stroke-width="1.5"/>
+<text x="475" y="728" text-anchor="middle" class="note">Больше пространства сверху</text>
+<rect x="636" y="464" width="290" height="286" rx="8" fill="white" stroke="#d8e0e3"/>
+<text x="781" y="492" text-anchor="middle" class="label">Отступ 20%</text>
+<defs><clipPath id="clip-1-2"><rect x="711" y="508" width="140" height="190"/></clipPath></defs>
+<rect x="711" y="508" width="140" height="190" fill="#e4efee"/>
+<g clip-path="url(#clip-1-2)"><use xlink:href="#portrait" transform="translate(613.8000 531.3700) scale(2.090000)"/></g>
+<line x1="712" y1="546.0000" x2="850" y2="546.0000" stroke="#4d9966" stroke-width="2"/>
+<line x1="712" y1="598.2500" x2="850" y2="598.2500" stroke="#3399e6" stroke-width="2"/>
+<rect x="711" y="508" width="140" height="190" fill="none" stroke="#437d7a" stroke-width="1.5"/>
+<text x="781" y="728" text-anchor="middle" class="note">Лицо ниже, размер тот же</text>
+<text x="24" y="778" class="note">Схема показывает действие настроек. При обработке нескольких портретов скрипт согласует лица.</text>
+<text x="24" y="802" class="small">Для общей линии глаз и перекрытия рамки фактический отступ может быть больше заданного.</text>
 </svg>

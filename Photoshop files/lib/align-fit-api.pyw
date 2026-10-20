@@ -10,7 +10,7 @@ API_HOST = "127.0.0.1"
 API_PORT_SEND = 6321       # Python -> JSX
 API_PORT_LISTEN = 6320     # JSX -> Python
 TIMEOUT = 15 * 60
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.6.2"
 
 # Models are installed with the private runtime, outside the Photoshop folder.
 # sys.prefix points to the active venv when the server is started by launcher.vbs.
@@ -32,6 +32,7 @@ SIZE_WEIGHT = 0.75
 
 last_request_time = time.time()
 active_requests = 0
+analysis_requests = {}
 activity_lock = threading.Lock()
 model_lock = threading.Lock()
 model_init_lock = threading.Lock()
@@ -374,15 +375,30 @@ def visual_center_x(mask_bbox, mask_center_x, face_boxes, side_cropped=False):
     return max(x1, min(x2, result))
 
 
-def analyze_image(path, portraits=False):
+class AnalysisCancelled(Exception):
+    pass
+
+
+def check_analysis_cancelled(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise AnalysisCancelled()
+
+
+def analyze_image(path, portraits=False, cancel_event=None):
+    check_analysis_cancelled(cancel_event)
     np, cv2, human_segmenter, face_detector = get_models()
+    check_analysis_cancelled(cancel_event)
     image = read_image(path, np, cv2)
     if image is None:
         raise RuntimeError("Cannot read preview: %s" % path)
     h, w = image.shape[:2]
     with model_lock:
+        check_analysis_cancelled(cancel_event)
         human_mask = human_segmenter.mask(image)
+        check_analysis_cancelled(cancel_event)
         face_detections = face_detector.detect(image)
+
+    portrait_mask, portrait_origin = human_mask, (0, 0)
 
     bbox, mask_center_x, face_boxes = human_geometry_from_mask(human_mask, np, cv2, face_detections)
 
@@ -399,6 +415,7 @@ def analyze_image(path, portraits=False):
         if cx2 - cx1 >= 32 and cy2 - cy1 >= 32:
             crop = image[cy1:cy2, cx1:cx2]
             with model_lock:
+                check_analysis_cancelled(cancel_event)
                 refined_mask = human_segmenter.mask(crop)
             local_faces = []
             for fx1, fy1, fx2, fy2 in face_boxes:
@@ -409,6 +426,7 @@ def analyze_image(path, portraits=False):
                 refined_mask, np, cv2, local_faces
             )
             if refined is not None:
+                portrait_mask, portrait_origin = refined_mask, (cx1, cy1)
                 bbox = [
                     refined[0] + cx1,
                     refined[1] + cy1,
@@ -465,8 +483,10 @@ def analyze_image(path, portraits=False):
     # Require one raw AND one retained detection: a group must not become a
     # portrait merely because a second small face was filtered out.
     if portraits and len(face_boxes) == 1 and len(face_detections) == 1 and bbox is not None:
+        check_analysis_cancelled(cancel_event)
         try:
-            result["portrait"] = portrait_measurements(image, face_boxes[0], bbox, np, cv2)
+            result["portrait"] = portrait_measurements(image, face_boxes[0], bbox, np, cv2,
+                portrait_mask, portrait_origin)
             if result["portrait"] is None:
                 result["portrait_error"] = "Unreliable face landmarks"
         except Exception as exc:
@@ -482,7 +502,108 @@ _portrait_error = None
 _portrait_lock = threading.Lock()
 
 
-def portrait_measurements(image, box, envelope, np, cv2):
+def portrait_head_top(mask, origin, box, eyes, forehead, fallback, np, cv2):
+    """Measure the crown on the existing mask near this face, not the whole body."""
+    if mask is None:
+        return fallback
+    x1, y1, x2, y2 = box
+    fw, fh = x2-x1, y2-y1
+    ox, oy = origin
+    h, w = mask.shape[:2]
+    left = max(0, int(math.floor(x1-fw*.25-ox)))
+    right = min(w, int(math.ceil(x2+fw*.25-ox)))
+    top = 0
+    bottom = min(h, int(math.ceil(eyes[1]+fh*.15-oy)))
+    if right <= left or bottom <= top:
+        return fallback
+    binary = (mask[top:bottom, left:right] > 0).astype(np.uint8)
+    count, labels, _stats, _centers = cv2.connectedComponentsWithStats(binary, 8)
+    if count <= 1:
+        return fallback
+    # Pick the component attached to the forehead/eye band. A detached raised
+    # hand or segmentation speck above it must not become the crown.
+    band_top = max(0, min(bottom-top-1, int(forehead-oy-top)))
+    band_left = max(0, int(x1-ox-left))
+    band_right = min(right-left, int(math.ceil(x2-ox-left)))
+    if band_right <= band_left:
+        return fallback
+    votes = np.bincount(labels[band_top:, band_left:band_right].ravel(), minlength=count)
+    votes[0] = 0
+    label = int(votes.argmax())
+    if votes[label] == 0:
+        return fallback
+    rows = np.count_nonzero(labels == label, axis=1) >= max(2, int(round(fw*.08)))
+    sustained = np.flatnonzero(rows[:-1] & rows[1:])
+    if not sustained.size:
+        return fallback
+    return max(0., min(float(forehead), float(oy+top+sustained[0])))
+
+
+def contour_height(mask, eye, eye_span, np, cv2):
+    """Conservative measurement in an eye-levelled local crop, or None."""
+    h, w = mask.shape
+    ex, ey = eye
+    if eye_span < 16 or not (0 <= ex < w and 0 <= ey < h):
+        return None
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    x0, x1 = max(0, int(ex - eye_span*.22)), min(w, int(ex + eye_span*.22)+1)
+    y0, y1 = max(0, int(ey)), min(h, int(ey + eye_span*.3)+1)
+    ids = labels[y0:y1, x0:x1].ravel()
+    ids = ids[ids > 0]
+    if not ids.size:
+        return None
+    label = int(np.bincount(ids).argmax())
+    if stats[label, cv2.CC_STAT_TOP] <= 2:
+        return None  # crop/image top touched: no reliable crown
+    component = labels == label
+    if np.mean(component[y0:y1, x0:x1]) < .85:
+        return None
+    tops = []
+    for x in range(x0, x1):
+        ys = np.flatnonzero(component[:min(h, int(ey)+1), x])
+        if len(ys):
+            tops.append(float(ys[0]))
+    if len(tops) < .8 * (x1-x0):
+        return None
+    top = float(np.median(tops))
+    height = ey - top
+    if not .45 * eye_span < height < 1.6 * eye_span:
+        return None
+    if float(np.percentile(tops, 90)-np.percentile(tops, 10)) > .20 * eye_span:
+        return None
+    return float(height)
+
+
+def portrait_head_height(mask, origin, points, np, cv2):
+    """Eye-to-crown distance, levelled exactly as in Face alignment."""
+    if mask is None:
+        return 0.
+    left, right = np.array(points[33]), np.array(points[263])
+    eye = (left+right)*.5
+    span = float(np.linalg.norm(right-left))
+    if span < 20:
+        return 0.
+    axis = (right-left)/span
+    down = np.array([-axis[1], axis[0]])
+    unit = 100.
+    local_eye = eye-np.array(origin)
+    matrix = np.array([[axis[0]*unit/span, axis[1]*unit/span, 180.-np.dot(axis,local_eye)*unit/span],
+                       [down[0]*unit/span, down[1]*unit/span, 200.-np.dot(down,local_eye)*unit/span]])
+    # Validate the same measurement rectangle without allocating/warping a full
+    # validity mask. An affine rectangle is valid when all four corners are.
+    inverse = cv2.invertAffineTransform(matrix)
+    corners = np.array([[125.,30.,1.],[235.,30.,1.],[125.,225.,1.],[235.,225.,1.]]) @ inverse.T
+    h, w = mask.shape[:2]
+    if (corners[:,0].min() < 0 or corners[:,1].min() < 0 or
+            corners[:,0].max() > w-1 or corners[:,1].max() > h-1):
+        return 0.
+    patch = cv2.warpAffine(mask, matrix, (360,360), flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT)
+    height = contour_height(patch, (180.,200.), unit, np, cv2)
+    return height*span/unit if height is not None else 0.
+
+
+def portrait_measurements(image, box, envelope, np, cv2, mask=None, mask_origin=(0, 0)):
     global _portrait_detector, _portrait_error
     with _portrait_lock:
         if _portrait_error:
@@ -525,25 +646,30 @@ def portrait_measurements(image, box, envelope, np, cv2):
     metrics = [dist(points[33], points[263]), dist(points[133], points[362]),
         dist(points[234], points[454]), dist(points[127], points[356]),
         dist(eyes, points[152]), dist(points[168], points[152])]
-    if not all(math.isfinite(v) and v > 2 for v in metrics):
+    metrics = [v if math.isfinite(v) and v > 0 else 0. for v in metrics]
+    if sum(math.isfinite(v) and v > 2 for v in metrics) < 4 or metrics[0] < 12:
         return None
-    # Large yaw makes 2D facial scale unreliable; retain the ordinary placement.
-    left, right = dist(points[127], points[33]), dist(points[356], points[263])
-    if min(left, right) < .25 * max(left, right) or metrics[0] < 12:
-        return None
+    head_top = portrait_head_top(mask, mask_origin, box, eyes, points[10][1],
+        max(0., min(float(envelope[1]), points[10][1])), np, cv2)
+    try:
+        head_height = portrait_head_height(mask, mask_origin, points, np, cv2)
+    except Exception:
+        # Optional contour uncertainty must never discard reliable face metrics.
+        head_height = 0.
     return {"eye": eyes, "metrics": metrics,
-        "head_top": max(0., min(float(envelope[1]), points[10][1])),
+        "head": head_height,
+        "head_top": head_top,
         "chin": max(eyes[1]+1., points[152][1]),
         "head_left": max(0., min(box[0], points[234][0], points[127][0]) - metrics[0]*.15),
         "head_right": min(float(w), max(box[2], points[454][0], points[356][0]) + metrics[0]*.15)}
 
 
-def facial_ratio(reference, measured):
-    """Same robust six-measurement ratio as Face alignment, without head bias."""
+def facial_ratio(reference, measured, reference_head=0., measured_head=0.):
+    """Face alignment portraitScale: robust face ratio and bounded head correction."""
     weights = [.25, .10, .15, .10, .25, .15]
     items = sorted((math.log(a/b), w) for a, b, w in zip(reference, measured, weights)
         if a > 2 and b > 2 and math.isfinite(a) and math.isfinite(b))
-    if len(items) < 4:
+    if len(items) < 4 or not (reference[0] > 2 and measured[0] > 2):
         raise ValueError("Insufficient face measurements")
     acc, center = 0., items[0][0]
     half_weight = sum(w for _, w in items)*.5
@@ -559,6 +685,11 @@ def facial_ratio(reference, measured):
     for _ in range(3):
         robust = [(v, w*min(1., huber/max(1e-12, abs(v-center)))) for v, w in items]
         center = sum(v*w for v, w in robust)/sum(w for _, w in robust)
+    if (reference_head > 0 and measured_head > 0 and
+            math.isfinite(reference_head) and math.isfinite(measured_head)):
+        delta = math.log(reference_head/measured_head)-center
+        if abs(delta) <= math.log(1.20):
+            center += max(-math.log(1.025), min(math.log(1.025), delta*.12))
     return math.exp(center)
 
 
@@ -574,12 +705,22 @@ def _portrait_domain(items):
         qlo = max(qlo, (W+2*bleed)*u/(w*H))
         if "head_left" in v:
             left, right = v["head_left"], v["head_right"]
-            if left <= 0 or right >= w or right <= left:
-                return None  # already cropped at an image edge
-            qlo = max(qlo, bleed*u/(H*left), bleed*u/(H*(w-right)))
-            qhi = min(qhi, W*u/(H*(right-left)))
-        lower.extend([(-(h-ey)/u, 1+bleed/H), ((ey-v["head_top"])/u, v["top"])])
-        upper.extend([(ey/u, -bleed/H), (-(v["chin"]-ey)/u, 1-v["bottom"])])
+            if right <= left:
+                return None
+            # An edge already missing in the source cannot be preserved by a
+            # transform. Keep its reliable face scale in the portrait batch.
+            if left > 0:
+                qlo = max(qlo, bleed*u/(H*left))
+            if right < w:
+                qlo = max(qlo, bleed*u/(H*(w-right)))
+            if left > 0 and right < w:
+                qhi = min(qhi, W*u/(H*(right-left)))
+        lower.append((-(h-ey)/u, 1+bleed/H))
+        if v["head_top"] > 0:
+            lower.append(((ey-v["head_top"])/u, v["top"]))
+        upper.append((ey/u, -bleed/H))
+        if v["chin"] < h:
+            upper.append((-(v["chin"]-ey)/u, 1-v["bottom"]))
     for a, b in lower:
         for c, d in upper:
             k, rhs = a-c, d-b
@@ -608,12 +749,18 @@ def solve_portrait_layout(payload):
     if not source:
         return {"solutions": [], "adjusted": False, "unequal": False}
     # Choose a median face as the robust reference; no dependence on layer order.
-    reference = sorted(source, key=lambda v: (v["portrait"]["metrics"][4], str(v["id"])))[len(source)//2]["portrait"]["metrics"]
+    candidates = [v for v in source if v["portrait"]["metrics"][4] > 2
+        and math.isfinite(v["portrait"]["metrics"][4])]
+    if not candidates:
+        return {"solutions": [], "rejected": [v["id"] for v in source], "unequal": False, "adjusted": False}
+    reference_portrait = sorted(candidates, key=lambda v: (v["portrait"]["metrics"][4], str(v["id"])))[len(candidates)//2]["portrait"]
+    reference = reference_portrait["metrics"]
     items, rejected = [], []
     for item in source:
         p, layer, frame = item["portrait"], item["layer"], item["frame"]
         try:
-            ratio = facial_ratio(reference, p["metrics"])
+            ratio = facial_ratio(reference, p["metrics"],
+                reference_portrait.get("head", 0.), p.get("head", 0.))
             unit = reference[4]/ratio
             v = {"id": item["id"], "w": float(layer["width"]), "h": float(layer["height"]),
                 "H": float(frame["height"]), "W": float(frame["width"]),
@@ -656,10 +803,14 @@ def solve_portrait_layout(payload):
     if domain:
         q, e = _choose_portrait(domain, desired_q, desired_e)
     else:
-        # Incompatible original crops: preserve heads/coverage, and minimize each
-        # portrait's departure from the common requested composition. Never hide
-        # this compromise from the caller.
-        q, e = desired_q, desired_e
+        # Eye-height intervals can disagree while all scale intervals overlap.
+        # Preserve that common scale before compromising individual eye levels.
+        qlo = max(v["domain"][0] for v in items)
+        qhi = min(v["domain"][1] for v in items)
+        q = max(qlo, min(qhi, desired_q)) if qlo <= qhi else max(qlo, desired_q)
+        elo = max(max(a*q+b for a, b in v["domain"][2]) for v in items)
+        ehi = min(min(a*q+b for a, b in v["domain"][3]) for v in items)
+        e = (elo+ehi)*.5 if desired_e is None else desired_e
     result = []
     for v in items:
         if unequal:
@@ -675,8 +826,10 @@ def solve_portrait_layout(payload):
         xlo = v["fx"]+v["W"]+v["bleed"]-scale*v["w"]
         xhi = v["fx"]-v["bleed"]
         if "head_left" in v:
-            xlo = max(xlo, v["fx"]-scale*v["head_left"])
-            xhi = min(xhi, v["fx"]+v["W"]-scale*v["head_right"])
+            if v["head_left"] > 0:
+                xlo = max(xlo, v["fx"]-scale*v["head_left"])
+            if v["head_right"] < v["w"]:
+                xhi = min(xhi, v["fx"]+v["W"]-scale*v["head_right"])
         tx = max(xlo, min(xhi, tx))
         ty = v["fy"]+ei*v["H"]-scale*v["ey"]
         result.append({"id": v["id"], "scale": scale, "tx": tx, "ty": ty,
@@ -812,14 +965,8 @@ def match_group(subjects, frames, use_face_count=True):
         # When all counts tie, omit this preference entirely (also with surplus
         # frames), so only the supplied composition costs decide the assignment.
         use_face_count = len(set(int(x.get("faces", 0)) for x in ranked_subjects)) > 1
-        s_rank = average_ranks(
-            ranked_subjects,
-            lambda x: int(x.get("faces", 0)),
-        )
-        f_rank = average_ranks(frames, lambda x: float(x.get("area", 0.0)))
-    else:
-        s_rank = {}
-        f_rank = {}
+    s_rank = average_ranks(ranked_subjects, lambda x: int(x.get("faces", 0))) if use_face_count else {}
+    f_rank = average_ranks(frames, lambda x: float(x.get("area", 0.0))) if use_face_count else {}
 
     matrix = []
     for subject in subjects:
@@ -943,6 +1090,7 @@ def request_finished():
 def handle_client(client_socket, server):
     started = False
     request_id = None
+    cancel_event = None
     try:
         with client_socket:
             client_socket.settimeout(10)
@@ -952,6 +1100,15 @@ def handle_client(client_socket, server):
             msg_type = message.get("type")
             payload = message.get("message")
             request_id = message.get("request_id")
+
+            # Fire-and-forget: Photoshop has already stopped listening when it
+            # cancels. Keep the loaded models, but stop processing this batch.
+            if msg_type == "cancel":
+                with activity_lock:
+                    event = analysis_requests.get((payload or {}).get("request_id"))
+                    if event is not None:
+                        event.set()
+                return
 
             def reply(reply_type, reply_message):
                 out = {"type": reply_type, "message": reply_message}
@@ -967,14 +1124,22 @@ def handle_client(client_socket, server):
                 reply("answer", {"status": "success", "version": SERVER_VERSION, "idle_timeout": TIMEOUT})
             elif msg_type == "analyze":
                 items = (payload or {}).get("items") or []
+                cancel_event = threading.Event()
+                with activity_lock:
+                    analysis_requests[request_id] = cancel_event
                 result = []
                 for item in items:
+                    if cancel_event.is_set():
+                        break
                     item_id = item.get("id")
                     path = item.get("path", "")
                     try:
-                        info = analyze_image(path, portraits=bool((payload or {}).get("portraits", False)))
+                        info = analyze_image(path, portraits=bool((payload or {}).get("portraits", False)),
+                            cancel_event=cancel_event)
                         info["id"] = item_id
                         result.append(info)
+                    except AnalysisCancelled:
+                        break
                     except Exception as exc:
                         result.append(
                             {
@@ -987,7 +1152,11 @@ def handle_client(client_socket, server):
                         )
                     finally:
                         safe_remove_preview(path)
-                reply("answer", {"items": result})
+                if cancel_event.is_set():
+                    for item in items:
+                        safe_remove_preview(item.get("path", ""))
+                else:
+                    reply("answer", {"items": result})
             elif msg_type == "portrait_layout":
                 reply("answer", solve_portrait_layout(payload or {}))
             elif msg_type == "match":
@@ -1007,6 +1176,9 @@ def handle_client(client_socket, server):
             out["request_id"] = request_id
         send_data_to_jsx(out)
     finally:
+        if cancel_event is not None:
+            with activity_lock:
+                analysis_requests.pop(request_id, None)
         if started:
             request_finished()
 
