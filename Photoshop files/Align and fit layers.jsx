@@ -17,7 +17,9 @@
 // END__HARVEST_EXCEPTION_ZSTRING
 */
 
-var SCRIPT_VERSION = '0.7.13',
+// true: JPEG via opened prepared Smart Object; false/absent: direct PSB.
+const USE_LEGACY_JPEG = false;
+var SCRIPT_VERSION = '0.7.14',
     SCRIPT_NAME = 'Align and fit layers',
     UUID = '5a2946a7-c3d1-430b-8527-c854f5bb7241',
     API_HOST = '127.0.0.1',
@@ -25,7 +27,7 @@ var SCRIPT_VERSION = '0.7.13',
     API_PORT_LISTEN = 6321,
     API_FILES = ['lib/align-fit-api.pyw', 'align-fit-api.pyw'],
     RUNTIME_NAME = 'AlignFitRuntime',
-    EXPECTED_SERVER_VERSION = '0.6.4',
+    EXPECTED_SERVER_VERSION = '0.6.5',
     PREVIEW_MAX = 1280,
     FINAL_BLEED_PX = 2,
     INIT_DELAY = 15000,
@@ -136,6 +138,10 @@ function runScript() {
                 doc.setSelectionMode(runCtx.originalSelectionMode);
             }
         } catch (restoreModeError) { }
+        if(runCtx && runCtx.analysisBatch && afApi) {
+            try {afApi.sendPayload('batch_abort',{batch_id:runCtx.analysisBatch},MATCH_DELAY);} catch(ignoreBatch) {}
+            runCtx.analysisBatch=null;
+        }
         try { if (runCtx && runCtx.tempFiles) cleanupTempFiles(runCtx.tempFiles); } catch (cleanupError) { }
         try { if (runCtx && runCtx.sourceDoc) app.activeDocument = runCtx.sourceDoc; } catch (docError) { }
         try { if (runCtx && runCtx.targetIds) reselectLayers(runCtx.targetIds); } catch (selectError) { }
@@ -211,6 +217,7 @@ function createRunContext() {
             color: info.color,
             visible: info.visible,
             smartObject: info.smartObject,
+            kind:info.kind, bounds:info.bounds,
             clipped: isClipped,
             clippingBaseId: null
         };
@@ -356,7 +363,8 @@ function prepareAnalysisCache() {
         var id = ctx.subjectTargetIds[i], meta = ctx.layerMeta[String(id)],
             name = meta.name,
             key = session + '|' + documentId + '|' + id + '|' +
-                (meta.smartObject ? 'S' : 'R') + '|' + name.length + ':' + name;
+                (meta.smartObject ? 'S' : 'R') + '|' + name.length + ':' + name + '|' + PREVIEW_MAX + '|' +
+                (typeof USE_LEGACY_JPEG!='undefined' && USE_LEGACY_JPEG===true?'jpg':'psb');
         ctx.analysisCacheKeys[String(id)] = key;
         items.push({ id: id, cache_key: key });
     }
@@ -381,65 +389,77 @@ function prepareAnalysisCache() {
 }
 
 function preparePythonStage() {
-    var ctx = runCtx,
-        oldDialogs = app.displayDialogs;
+    var ctx=runCtx, oldDialogs=app.displayDialogs;
     prepareAnalysisCache();
-    // A full hit needs neither temporary Smart Objects nor a history rollback.
-    if (!ctx.previewTargetIds.length) return;
+    if(!ctx.previewTargetIds.length) return;
+    var info=doc.getDocumentInfo();
+    if(!info || (info.mode!='RGBColor' && info.mode!='RGBColorMode') || (info.depth!=8 && info.depth!=16 && info.depth!=32))
+        throw new Error(L({ru:'Для Python-анализа нужен документ RGB, 8/16/32 бита на канал. Выберите Изображение → Режим → RGB.',en:'Python analysis requires an RGB document, 8/16/32 bits per channel. Choose Image > Mode > RGB Color.'}));
+    if(!isFiniteNumber(PREVIEW_MAX) || PREVIEW_MAX<=0) throw new Error('Invalid PREVIEW_MAX');
+    ctx.previewHistory=ctx.sourceDoc.activeHistoryState;
+    ctx.previewLayerCount=doc.getProperty('numberOfLayers');
+    ctx.previewError=null;
     try {
-        // All Photoshop actions used by preview preparation are silent. Set this
-        // once for the batch instead of crossing the DOM bridge for every layer.
-        app.displayDialogs = DialogModes.NO;
-        ctx.sourceDoc.suspendHistory('Prepare Align and Fit previews', 'preparePythonPreviewsLoop();');
-        if (ctx.items.length != ctx.previewTargetIds.length) {
-            throw new Error('Python preview export incomplete: ' + ctx.items.length + ' of ' + ctx.previewTargetIds.length + ' layers.');
+        ctx.analysisBatch=afApi.sendPayload('batch_begin',{portraits:!!cfg.portraits},MATCH_DELAY);
+        app.displayDialogs=DialogModes.NO;
+        try {ctx.sourceDoc.suspendHistory('Prepare Align and Fit previews','preparePythonPreviewsLoop();');}
+        catch(e) {ctx.previewError=e;}
+        finally {
+            app.changeProgressText(L(str.restoreLayers));
+            restorePythonPreviewHistory();
         }
-        app.changeProgressText(L(str.restoreLayers));
-        undoPreviewHistory(ctx.sourceDoc);
-        ctx.previewRestored = true;
+        if(ctx.previewError) throw ctx.previewError;
+        if(ctx.items.length!=ctx.previewTargetIds.length) throw new Error('Python preview preparation is incomplete');
         reselectLayers(ctx.targetIds);
-    } catch (e) {
-        try {
-            if (ctx.previewTouched && !ctx.previewRestored) {
-                app.activeDocument = ctx.sourceDoc;
-                undoPreviewHistory(ctx.sourceDoc);
-                ctx.previewRestored = true;
-                reselectLayers(ctx.targetIds);
-            }
-        } catch (restoreError) {
-            throw new Error(e.message + '\nAdditionally failed to restore preview history: ' + restoreError.message);
+    } catch(e) {
+        if(ctx.analysisBatch) {
+            try {afApi.sendPayload('batch_abort',{batch_id:ctx.analysisBatch},MATCH_DELAY);} catch(ignore) {}
+            ctx.analysisBatch=null;
         }
         throw e;
-    } finally {
-        app.displayDialogs = oldDialogs;
+    } finally {app.displayDialogs=oldDialogs;}
+}
+
+function previewHistoryBoundary() {}
+function restorePythonPreviewHistory() {
+    var ctx=runCtx;
+    app.activeDocument=ctx.sourceDoc;
+    ctx.sourceDoc.suspendHistory('Prepare Align and Fit previews','previewHistoryBoundary();');
+    ctx.sourceDoc.activeHistoryState=ctx.previewHistory;
+    if(doc.getProperty('numberOfLayers')!=ctx.previewLayerCount) throw new Error('Preview history did not restore the layer count');
+    for(var i=0;i<ctx.previewTargetIds.length;i++) {
+        var id=ctx.previewTargetIds[i], meta=ctx.layerMeta[String(id)],
+            b=doc.descToObject(lr.getProperty('boundsNoEffects',false,id)), keys=['left','top','right','bottom'];
+        if(lr.getProperty('layerKind',false,id)!=meta.kind) throw new Error('Preview history did not restore layer '+id);
+        for(var j=0;j<keys.length;j++)
+            if(!isFiniteNumber(Number(b[keys[j]])) || Math.abs(Number(b[keys[j]])-Number(meta.bounds[keys[j]]))>.001)
+                throw new Error('Preview history did not restore bounds of layer '+id);
     }
+    ctx.previewRestored=true;
 }
 
 function preparePythonPreviewsLoop() {
-    var n = runCtx.previewTargetIds.length,
-        slice = 1 / Math.max(1, n);
-    for (var i = 0; i < n; i++) {
-        if (app.doProgressTask(slice, 'preparePythonPreviewChunk(' + i + ');') === false) throw makeUserCancelError();
-    }
+    // Let Photoshop finish the history callback normally before handling errors.
+    try {
+        var n=runCtx.previewTargetIds.length, slice=1/Math.max(1,n);
+        for(var i=0;i<n;i++)
+            if(app.doProgressTask(slice,'preparePythonPreviewChunk('+i+');')===false) throw makeUserCancelError();
+    } catch(e) {runCtx.previewError=e;}
 }
 
 function preparePythonPreviewChunk(i) {
-    var id = runCtx.previewTargetIds[i],
-        meta = runCtx.layerMeta[String(id)],
-        name = meta ? meta.name : lr.getProperty('name', false, id),
-        text = L(str.prepareImages) + ': ' + (i + 1) + '/' + runCtx.previewTargetIds.length + ' — ' + name;
+    var id=runCtx.previewTargetIds[i],meta=runCtx.layerMeta[String(id)],
+        text=L(str.prepareImages)+': '+(i+1)+'/'+runCtx.previewTargetIds.length+' — '+meta.name;
     app.changeProgressText(text);
-    $.sleep(0);
-    app.activeDocument = runCtx.sourceDoc;
+    app.activeDocument=runCtx.sourceDoc;
     lr.selectLayer(id);
-    if (!meta.visible) lr.setLayerVisiblity(id, true);
-    runCtx.previewTouched = true;
-    protectTemporarySmartObjectName(id, name);
-    var preview = exportLayerPreview(runCtx.sourceDoc, id, i, runCtx.tempFiles);
-    if (preview) {
-        preview.cache_key = runCtx.analysisCacheKeys[String(id)] || null;
-        runCtx.items.push(preview);
-    }
+    if(!meta.visible) lr.setLayerVisiblity(id,true);
+    runCtx.previewTouched=true;
+    protectTemporarySmartObjectName(id,meta.name);
+    var preview=exportLayerPreview(runCtx.sourceDoc,id,i,runCtx.tempFiles);
+    preview.cache_key=runCtx.analysisCacheKeys[String(id)] || null;
+    afApi.sendPayload('batch_add',{batch_id:runCtx.analysisBatch,index:runCtx.items.length,item:preview},MATCH_DELAY);
+    runCtx.items.push(preview);
 }
 
 function pythonAnalysisProgressChunk() {
@@ -456,11 +476,18 @@ function analyzePythonStage() {
     // Large selections can legitimately take longer than the fixed base timeout.
     // Keep a generous per-image allowance while capping the wait at 15 minutes.
     var analyzeDelay = Math.max(ANALYZE_DELAY, Math.min(15 * 60 * 1000, runCtx.items.length * 10000)),
-        analyzed = afApi.sendPayload('analyze', { items: runCtx.items, portraits: !!cfg.portraits }, analyzeDelay, true);
-    if (!analyzed || !analyzed.items) throw new Error('Python returned an invalid analysis response.');
+        analyzed = afApi.sendPayload('batch_finish', {batch_id:runCtx.analysisBatch}, analyzeDelay, true);
+    if (!analyzed || !analyzed.items || analyzed.items.length!=runCtx.items.length) throw new Error('Python returned an incomplete analysis response.');
+    var expected={};
+    for(var i=0;i<runCtx.items.length;i++) expected[String(runCtx.items[i].id)]=true;
     for (var ai = 0; ai < analyzed.items.length; ai++) {
-        runCtx.analysisMap[String(analyzed.items[ai].id)] = analyzed.items[ai];
+        var key=String(analyzed.items[ai].id);
+        if(!expected[key]) throw new Error('Python returned an unexpected or duplicate layer ID');
+        delete expected[key];
+        runCtx.analysisMap[key] = analyzed.items[ai];
     }
+    try {afApi.sendPayload('batch_abort',{batch_id:runCtx.analysisBatch},MATCH_DELAY);} catch(ignoreBatch) {}
+    runCtx.analysisBatch=null;
     cleanupTempFiles(runCtx.tempFiles);
     runCtx.tempFiles = [];
 }
@@ -762,6 +789,8 @@ function LayerMetadataCache() {
             info.clipped = d.getBoolean(s2t('group'));
             info.visible = d.getBoolean(s2t('visible'));
             info.smartObject = d.hasKey(s2t('smartObject'));
+            info.kind=d.getInteger(s2t('layerKind'));
+            info.bounds=d.hasKey(s2t('boundsNoEffects'))?doc.descToObject(d.getObjectValue(s2t('boundsNoEffects'))):null;
             info.index = d.getInteger(s2t('itemIndex')) - backgroundOffset;
             ids[String(info.id)] = info;
             indices[String(info.index)] = info;
@@ -1639,91 +1668,61 @@ function finishSubjectGeometry(subject, layerBounds) {
     }
 }
 
-function exportLayerPreview(sourceDoc, id, index, tempFiles) {
-    var smartDoc = null,
-        file = null,
-        stage = 'prepare source layer';
+function exportLayerPreview(sourceDoc,id,index,tempFiles) {
+    var smartDoc=null, stage='prepare source layer',meta=runCtx.layerMeta[String(id)],
+        original=meta.bounds, legacyJPEG=typeof USE_LEGACY_JPEG!='undefined' && USE_LEGACY_JPEG===true;
     try {
-        // preparePythonPreviewChunk() already made sourceDoc active and selected id.
-        // Avoid repeating a document switch and layer selection for every preview.
-        var stamp = (new Date()).getTime(),
-            token = Math.floor(Math.random() * 1000000);
-
-        // Work on the ORIGINAL layer. Do not Undo here: all preview-related
-        // conversions are restored together after the complete preview pass.
-        // Rasterizing an existing Smart Object first avoids creating a nested
-        // Smart Object whose contents Photoshop must repeatedly render while
-        // resizing/exporting the temporary preview. The source state is restored
-        // by the single history rollback after the whole preview pass.
-        if (runCtx.layerMeta[String(id)].smartObject) {
-            stage = 'rasterize existing Smart Object for preview';
+        // Groups and other non-pixel layers are baked without opening contents.
+        if(meta.smartObject || meta.kind!=1) {
+            stage='rasterize source';
+            if(!meta.smartObject && meta.kind!=1) convertActiveLayerToSmartObject();
             lr.rasterize();
         }
-
-        stage = 'convert source layer to Smart Object';
+        var b=doc.descToObject(lr.getProperty('boundsNoEffects')),
+            w=Number(b.right)-Number(b.left),h=Number(b.bottom)-Number(b.top);
+        if(!(w>0 && h>0)) throw new Error('Empty layer bounds');
+        var cx=(Number(b.left)+Number(b.right))/2,cy=(Number(b.top)+Number(b.bottom))/2,
+            scale=Math.min(1,PREVIEW_MAX/Math.max(w,h));
+        stage='resize layer';
+        if(scale<1) lr.resizePreview(scale);
+        stage='convert prepared layer to Smart Object';
         convertActiveLayerToSmartObject();
-
-        stage = 'open Smart Object contents';
-        openActiveSmartObjectContents();
-        smartDoc = app.activeDocument;
-        if (!smartDoc || smartDoc == sourceDoc) throw new Error('Smart Object contents did not open.');
-
-        // Flatten even a one-layer temporary Smart Object. In the common case
-        // that layer is itself a placed/rasterized object; flattening it before
-        // imageSize/save avoids extra Smart Object rendering during export.
-        stage = 'flatten Smart Object contents';
-        doc.flatten();
-
-        // Read the temporary document descriptor once instead of crossing the
-        // slower DOM bridge for mode, bit depth and dimensions independently.
-        stage = 'read preview properties';
-        var previewInfo = doc.getDocumentInfo();
-        if (!previewInfo || !(previewInfo.width > 0) || !(previewInfo.height > 0)) {
-            throw new Error('Smart Object has invalid dimensions.');
-        }
-
-        stage = 'convert preview to RGB/8-bit';
-        if (!previewInfo.mode || !previewInfo.depth) throw new Error('Cannot read preview color mode or bit depth.');
-        if (previewInfo.mode != 'RGBColor' && previewInfo.mode != 'RGBColorMode') doc.convertToRGB();
-        if (previewInfo.depth != 8) doc.convertTo8Bit();
-
-        stage = 'resize preview';
-        var tw = Number(previewInfo.width),
-            th = Number(previewInfo.height),
-            maxSide = Math.max(tw, th);
-        if (maxSide > PREVIEW_MAX) {
-            var k = PREVIEW_MAX / maxSide;
-            doc.setScale(k);
-        }
-
-        stage = 'save JPEG preview';
-        file = new File(Folder.temp.fsName + '/align_fit_' + stamp + '_' + id + '_' + index + '_' + token + '.jpg');
-        doc.saveJpegCopy(file, 6);
-        if (!file.exists) throw new Error('JPEG file was not created.');
-
-        // Python reads the JPEG and returns its real pixel dimensions with the
-        // detection result, so sending preview width/height here was redundant.
-        var out = { id: id, path: file.fsName };
+        var more=lr.getProperty('smartObjectMore'),tr=more.getList(stringIDToTypeID('transform')),
+            q=[];
+        for(var j=0;j<8;j++) q.push(tr.getDouble(j));
+        var ow=Number(original.right)-Number(original.left),oh=Number(original.bottom)-Number(original.top),
+            mapping=[(q[2]-q[0])/scale/ow,(q[7]-q[1])/scale/oh,
+                (cx+(q[0]-cx)/scale-Number(original.left))/ow,
+                (cy+(q[1]-cy)/scale-Number(original.top))/oh];
+        for(var j=0;j<4;j++) if(!isFiniteNumber(mapping[j])) throw new Error('Invalid preview coordinate mapping');
+        if(mapping[0]<=0 || mapping[1]<=0) throw new Error('Invalid preview scale');
+        var file=new File(Folder.temp.fsName+'/align_fit_'+(new Date()).getTime()+'_'+id+'_'+index+'_'+Math.floor(Math.random()*1000000)+(legacyJPEG?'.jpg':'.psb'));
         tempFiles.push(file);
-
-        stage = 'close Smart Object contents';
-        doc.close(false);
-        smartDoc = null;
-        return out;
-    } catch (e) {
-        try {
-            if (smartDoc) {
-                app.activeDocument = smartDoc;
-                doc.close(false);
-                smartDoc = null;
+        if(legacyJPEG) {
+            stage='open prepared Smart Object';
+            try {
+                openActiveSmartObjectContents();
+                var current=app.activeDocument;
+                if(!current || current==sourceDoc) throw new Error('Prepared Smart Object did not open');
+                smartDoc=current;
+                stage='save JPEG copy';
+                if(doc.getProperty('depth')!=8) doc.convertTo8Bit();
+                doc.saveJpegCopy(file,6);
+            } finally {
+                if(!smartDoc && app.activeDocument!=sourceDoc) smartDoc=app.activeDocument;
+                if(smartDoc) try {app.activeDocument=smartDoc;doc.close(false);}
+                finally {app.activeDocument=sourceDoc;}
             }
-        } catch (ignore0) { }
-        try { if (file && file.exists) file.remove(); } catch (ignore2) { }
-        if (e.number == 8007) throw e;
-        throw new Error('Cannot create JPEG preview for layer ' + id + ' [' + stage + ']: ' + e.message);
-    } finally {
-        try { app.activeDocument = sourceDoc; } catch (ignore3) { }
-    }
+        } else {
+            stage='export PSB';
+            lr.exportSmartObject(file);
+        }
+        if(!file.exists || !file.length) throw new Error('Preview file was not created');
+        return {id:id,path:file.fsName,mapping:mapping};
+    } catch(e) {
+        if(e.number==8007) throw e;
+        throw new Error('Cannot prepare layer '+id+' ['+stage+']: '+e.message);
+    } finally {app.activeDocument=sourceDoc;}
 }
 
 // The JPEG path is already technical. Photoshop also derives the temporary
@@ -1763,7 +1762,7 @@ function cleanupTempFiles(files) {
 
 function cleanupStaleTempFiles() {
     try {
-        var files = Folder.temp.getFiles('align_fit_*.jpg'),
+        var files = Folder.temp.getFiles('align_fit_*.jpg').concat(Folder.temp.getFiles('align_fit_*.psb')),
             cutoff = (new Date()).getTime() - 60 * 60 * 1000;
         for (var i = 0; i < files.length; i++) {
             try {
@@ -2458,6 +2457,29 @@ function AM(target, order) {
         d.putUnitDouble(s2t('tolerance'), s2t('pixelsUnit'), 10);
         executeAction(s2t('make'), d, DialogModes.NO);
     }
+    this.resizePreview = function (scale) {
+        var d=new ActionDescriptor(), r=new ActionReference(), offset=new ActionDescriptor();
+        r.putEnumerated(s2t('layer'),s2t('ordinal'),s2t('targetEnum'));
+        d.putReference(s2t('null'),r);
+        d.putEnumerated(s2t('freeTransformCenterState'),s2t('quadCenterState'),s2t('QCSAverage'));
+        offset.putUnitDouble(s2t('horizontal'),s2t('pixelsUnit'),0);
+        offset.putUnitDouble(s2t('vertical'),s2t('pixelsUnit'),0);
+        d.putObject(s2t('offset'),s2t('offset'),offset);
+        d.putUnitDouble(s2t('width'),s2t('percentUnit'),scale*100);
+        d.putUnitDouble(s2t('height'),s2t('percentUnit'),scale*100);
+        d.putEnumerated(s2t('interfaceIconFrameDimmed'),s2t('interpolationType'),s2t('nearestNeighbor'));
+        executeAction(s2t('transform'),d,DialogModes.NO);
+    };
+    this.exportSmartObject = function (file) {
+        var d=new ActionDescriptor(), previousDialogs=app.displayDialogs;
+        d.putPath(s2t('null'),file);
+        try {
+            app.displayDialogs=DialogModes.NO;
+            executeAction(s2t('placedLayerExportContents'),d,DialogModes.NO);
+        } finally {
+            app.displayDialogs=previousDialogs;
+        }
+    };
     this.rasterize = function () {
         (r = new ActionReference()).putEnumerated(s2t('layer'), s2t('ordinal'), s2t('targetEnum'));
         (d = new ActionDescriptor()).putReference(s2t('target'), r);
@@ -2620,6 +2642,7 @@ function analysisApi(apiHost, portSend, portListen, apiFile, runtime) {
         var result = sendMessage({ type: type, message: payload }, delay, true, true, !!animateProgress);
         if (result) {
             if (result.type == 'answer') return result.message;
+            if (result.type == 'cancelled') throw makeUserCancelError();
             if (result.type == 'error') throw new Error(result.message);
         }
         throw new Error('No response from align-fit-api');
@@ -2700,7 +2723,12 @@ function analysisApi(apiHost, portSend, portListen, apiFile, runtime) {
                 var answer = listener.poll();
                 if (answer != null) {
                     var a = null;
-                    try { a = eval('(' + answer.readln() + ')'); } catch (e) { a = null; }
+                    try {
+                        answer.timeout=5;
+                        var body='',part;
+                        while(!answer.eof) {part=answer.read(65536);if(!part) break;body+=part;if(body.indexOf('\n')>=0) break;}
+                        a=eval('('+body+')');
+                    } catch (e) { a = null; }
                     try { answer.close(); } catch (e2) { }
 
                     // Ignore delayed replies from an older request. A legacy handshake
@@ -2716,7 +2744,7 @@ function analysisApi(apiHost, portSend, portListen, apiFile, runtime) {
             }
         } finally {
             try { if (listener) listener.close(); } catch (closeError) { }
-            if (sent && getData && o.type == 'analyze' && !received) cancelAnalysis(requestId);
+            if (sent && getData && o.type == 'batch_finish' && !received) cancelAnalysis(requestId);
         }
     }
 

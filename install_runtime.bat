@@ -293,9 +293,9 @@ rem the single contrib distribution required by MediaPipe.
 "%UV%" pip uninstall --python "%PY%" opencv-python opencv-python-headless opencv-contrib-python-headless
 if errorlevel 1 exit /b 1
 if "%PIP_INSECURE%"=="1" (
-    "%UV%" pip install --python "%PY%" --upgrade --no-build --reinstall-package opencv-contrib-python "numpy==%NUMPY_VERSION%" "opencv-contrib-python==%OPENCV_VERSION%" "mediapipe==%MEDIAPIPE_VERSION%" --allow-insecure-host pypi.org --allow-insecure-host files.pythonhosted.org
+    "%UV%" pip install --python "%PY%" --upgrade --no-build --reinstall-package opencv-contrib-python "numpy==%NUMPY_VERSION%" "opencv-contrib-python==%OPENCV_VERSION%" "pillow>=10.3" "mediapipe==%MEDIAPIPE_VERSION%" --allow-insecure-host pypi.org --allow-insecure-host files.pythonhosted.org
 ) else (
-    "%UV%" pip install --python "%PY%" --upgrade --no-build --reinstall-package opencv-contrib-python "numpy==%NUMPY_VERSION%" "opencv-contrib-python==%OPENCV_VERSION%" "mediapipe==%MEDIAPIPE_VERSION%"
+    "%UV%" pip install --python "%PY%" --upgrade --no-build --reinstall-package opencv-contrib-python "numpy==%NUMPY_VERSION%" "opencv-contrib-python==%OPENCV_VERSION%" "pillow>=10.3" "mediapipe==%MEDIAPIPE_VERSION%"
 )
 if errorlevel 1 (
     if "%PIP_INSECURE%"=="1" (
